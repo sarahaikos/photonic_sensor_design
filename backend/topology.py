@@ -35,9 +35,11 @@ def run_topology(
     if scene is None:
         return {"error": "Place a waveguide or coupler to run topology optimization."}
 
+    # 2D Helmholtz is reliable on a short window; TO/GDS use that slice of the coupler.
+    length_um = min(length_um, 3.6)
     dx_um = _dx_for(w_um, length_um, gap_um)
-    xs, ys, rho0, design, guides = _raster(scene, dx_um, w_um, gap_um)
-    r_px = max(0.6, 0.5 * mfs_nm / (dx_um * 1e3))
+    xs, ys, rho0, design, guides = _raster(dx_um, w_um, length_um, gap_um)
+    r_px = float(np.clip(0.5 * mfs_nm / (dx_um * 1e3), 0.8, 2.4))
     beta = float(max(1.0, min(beta, 32.0)))
     steps = int(max(0, min(steps, 20)))
 
@@ -51,7 +53,7 @@ def run_topology(
     if design.any() and gap_um is not None:
         rho = _seed_swg(rho, design, ys, dx_um)
 
-    target = 0.5 if kappa_target is None else float(np.clip(kappa_target, 0.05, 0.95))
+    target = float(np.clip(kappa_target if kappa_target is not None else 0.12, 0.05, 0.95))
     history: list[dict] = []
     field_ez = None
     t_th = t_dr = None
@@ -274,51 +276,51 @@ def _coupler_scene(width_nm: float, devices: list[dict]):
 
 
 def _dx_for(w_um: float, length_um: float, gap_um: float | None) -> float:
-    xspan = w_um + (gap_um + w_um if gap_um is not None else 0.0) + 1.2
-    yspan = length_um + 1.2
-    dx = 0.06
-    while (xspan / dx) * (yspan / dx) > 4800:
-        dx *= 1.12
+    pad = 0.8
+    xspan = w_um + (gap_um + w_um if gap_um is not None else 0.0) + pad
+    yspan = length_um + pad
+    dx = 0.04
+    while (xspan / dx) * (yspan / dx) > 10000:
+        dx *= 1.08
     return dx
 
 
-def _raster(scene: Scene, dx_um: float, w_um: float, gap_um: float | None):
-    x0, x1, y0, y1 = scene.bounds()
-    xs = np.arange(x0, x1 + dx_um, dx_um)
-    ys = np.arange(y0, y1 + dx_um, dx_um)
-    rho = np.zeros((xs.size, ys.size))
-    design = np.zeros_like(rho, dtype=bool)
+def _raster(dx_um: float, w_um: float, length_um: float, gap_um: float | None):
+    pad = 0.4
+    x1 = (gap_um + w_um if gap_um is not None else 0.0) + pad
+    xs = np.arange(-w_um - pad, x1 + dx_um * 0.5, dx_um)
+    ys = np.arange(-pad, length_um + pad + dx_um * 0.5, dx_um)
     xx, yy = np.meshgrid(xs, ys, indexing="ij")
-    for i, x in enumerate(xs):
-        for j, y in enumerate(ys):
-            rho[i, j] = 1.0 if scene.material_at(float(x), float(y)) == "si" else 0.0
+    rho = ((xx >= -w_um) & (xx <= 0.0) & (yy >= 0.0) & (yy <= length_um)).astype(float)
     if gap_um is not None:
-        inner = min(0.14, w_um * 0.35)
-        y_lo = ys.min() + 0.35
-        y_hi = ys.max() - 0.35
+        rho = np.maximum(
+            rho,
+            ((xx >= gap_um) & (xx <= gap_um + w_um) & (yy >= 0.0) & (yy <= length_um)).astype(float),
+        )
+    design = np.zeros_like(rho, dtype=bool)
+    if gap_um is not None:
+        inner = min(0.22, 0.5 * w_um)
+        bite = min(0.08, 0.35 * gap_um)
+        y_lo = 0.2
+        y_hi = length_um - 0.2
         along = (yy >= y_lo) & (yy <= y_hi)
-        through_inner = (xx >= -inner) & (xx <= 0.0)
-        drop_inner = (xx >= gap_um) & (xx <= gap_um + inner)
+        through_inner = (xx >= -inner) & (xx <= bite)
+        drop_inner = (xx >= gap_um - bite) & (xx <= gap_um + inner)
         design = along & (through_inner | drop_inner)
     guides = [
-        {"x0": float(-w_um), "y0": float(ys[0]), "width": float(w_um), "height": float(ys[-1] - ys[0])},
+        {"x0": float(-w_um), "y0": 0.0, "width": float(w_um), "height": float(length_um)},
     ]
     if gap_um is not None:
         guides.append(
-            {
-                "x0": float(gap_um),
-                "y0": float(ys[0]),
-                "width": float(w_um),
-                "height": float(ys[-1] - ys[0]),
-            }
+            {"x0": float(gap_um), "y0": 0.0, "width": float(w_um), "height": float(length_um)}
         )
     return xs, ys, rho, design, guides
 
 
 def _seed_swg(rho: np.ndarray, design: np.ndarray, ys: np.ndarray, dx_um: float) -> np.ndarray:
     """Hammood-style SWG: periodic notches on the inner waveguide sidewalls."""
-    period = max(2, int(round(0.40 / dx_um)))
-    teeth = (np.arange(ys.size) % period) < period * 0.45
+    period = max(4, int(round(0.40 / dx_um)))
+    teeth = (np.arange(ys.size) % period) < max(2, int(round(period * 0.4)))
     out = rho.copy()
     out[design & np.broadcast_to(teeth, out.shape)] = 0.0
     return out
@@ -349,8 +351,9 @@ def _optimize(
     history = []
     field_ez = None
     t_th = t_dr = None
+    npml = max(8, int(round(0.32 / dx_um)))
     for k in range(steps):
-        beta = min(beta_final, 1.0 * (1.35**k))
+        beta = min(beta_final, 2.0 * (1.22**k))
         rho_f = helmholtz_filter(rho, r_px)
         candidates = []
         for name, eta in _ROBUST_ETAS:
@@ -405,15 +408,23 @@ def _optimize(
         sens *= project_grad(rho_f, beta, worst["eta"])
         sens = helmholtz_filter(sens, r_px)
         sens *= design
-        scale = float(np.max(np.abs(sens))) or 1.0
-        updated = np.clip(rho - 0.08 * sens / scale, 0.0, 1.0)
-        rho = np.where(design, updated, rho)
+        peak = float(np.max(np.abs(sens[design]))) if design.any() else 1.0
+        step = 0.05 * sens / (peak + 1e-12)
+        updated = np.clip(rho - step, 0.0, 1.0)
+        rho = np.where(design, 0.75 * rho + 0.25 * updated, rho)
+        if e_fwd is not None:
+            field_ez = _ez_field(xs, ys, e_fwd)
     return rho, history, t_th, t_dr, field_ez
 
 
-def _robust_splits(
-    variants, xs, ys, dx_um, n_core, n_bg, wavelength_nm, w_um, gap_um, target
-):
+def _robust_splits(dilated, eroded, xs, ys, dx_um, n_core, n_bg, wavelength_nm, w_um, gap_um):
+    npml = max(8, int(round(0.32 / dx_um)))
+    d, _, ok_d = _fdfd_split(
+        dilated, xs, ys, dx_um, n_core, n_bg, wavelength_nm, w_um, gap_um, npml
+    )
+    e, _, ok_e = _fdfd_split(
+        eroded, xs, ys, dx_um, n_core, n_bg, wavelength_nm, w_um, gap_um, npml
+    )
     out = {}
     worst_name = None
     worst_err = -1.0
@@ -443,26 +454,36 @@ def _eps_pml(rho, xs, ys, dx_um, n_core, n_bg, wavelength_nm, npml=8):
     nx, ny = eps.shape
     for i in range(npml):
         r = ((npml - i) / npml) ** 2
-        s = 1.4 * r
+        s = 1.6 * r
         sigma[i, :] += s
         sigma[-1 - i, :] += s
     for j in range(npml):
         r = ((npml - j) / npml) ** 2
-        s = 1.4 * r
+        s = 1.6 * r
         sigma[:, j] += s
         sigma[:, -1 - j] += s
-    eps = eps + 1j * (0.04 + sigma) * (n_core**2)
+    eps = eps + 1j * (0.015 + sigma) * (n_core**2)
     return eps, k0, npml
 
 
-def _fdfd_split(rho, xs, ys, dx_um, n_core, n_bg, wavelength_nm, w_um, gap_um):
+def _jsrc_jmon(ny: int, npml: int, dx_um: float) -> tuple[int, int]:
+    jsrc = npml + 3
+    span = min(2.6, max(1.2, (ny - 2 * npml - 8) * dx_um))
+    jmon = jsrc + max(8, int(round(span / dx_um)))
+    jmon = min(jmon, ny - npml - 4)
+    return jsrc, max(jmon, jsrc + 8)
+
+
+def _fdfd_split(rho, xs, ys, dx_um, n_core, n_bg, wavelength_nm, w_um, gap_um, npml=8, x0=None):
     src = _src_profile(xs, w_um)
-    e, ok = _fdfd_solve(rho, xs, ys, dx_um, n_core, n_bg, wavelength_nm, src)
+    e, ok = _fdfd_solve(rho, xs, ys, dx_um, n_core, n_bg, wavelength_nm, src, npml, x0)
     if not ok:
         return None, e, False
-    jmon = max(8, ys.size - 10)
+    jsrc, jmon = _jsrc_jmon(ys.size, npml, dx_um)
     th = np.abs(xs + w_um / 2) <= w_um * 0.85
     dr = np.abs(xs - (gap_um + w_um / 2)) <= w_um * 0.85
+    if np.abs(e[:, jmon]).max() < 1e-3 * (np.abs(e[:, jsrc]).max() + 1e-30):
+        return None, e, False
     pth = float(np.sum(np.abs(e[th, jmon]) ** 2))
     pdr = float(np.sum(np.abs(e[dr, jmon]) ** 2))
     tot = pth + pdr + 1e-30
@@ -476,12 +497,11 @@ def _src_profile(xs, w_um):
     return src
 
 
-def _fdfd_solve(rho, xs, ys, dx_um, n_core, n_bg, wavelength_nm, src_x):
-    eps, k0, npml = _eps_pml(rho, xs, ys, dx_um, n_core, n_bg, wavelength_nm)
-    nx, ny = eps.shape
+def _fdfd_solve(rho, xs, ys, dx_um, n_core, n_bg, wavelength_nm, src_x, npml=8, x0=None):
+    eps, k0, npml = _eps_pml(rho, xs, ys, dx_um, n_core, n_bg, wavelength_nm, npml)
     dx = float(dx_um)
-    jsrc = npml + 2
-    b = np.zeros((nx, ny), dtype=complex)
+    jsrc, _ = _jsrc_jmon(eps.shape[1], npml, dx)
+    b = np.zeros_like(eps, dtype=complex)
     scale = k0**2
     if src_x.ndim == 1:
         b[:, jsrc] = src_x * scale
@@ -495,27 +515,34 @@ def _fdfd_solve(rho, xs, ys, dx_um, n_core, n_bg, wavelength_nm, src_x):
         lap = p[:-2, 1:-1] + p[2:, 1:-1] + p[1:-1, :-2] + p[1:-1, 2:] - 4 * p[1:-1, 1:-1]
         return lap / dx**2 + (k0**2) * eps * u
 
-    e, ok = _bicgstab(op, -b, tol=3e-3, maxiter=220)
+    e, ok = _bicgstab(op, -b, x0=x0, tol=1.5e-3, maxiter=320)
     usable = bool(np.isfinite(e).all() and np.abs(e).max() > 1e-8)
     return e, ok or usable
 
 
-def _adjoint_source(e_fwd, xs, w_um, gap_um, t_dr, target):
-    jmon = max(8, e_fwd.shape[1] - 10)
+def _adjoint_source(e_fwd, xs, dx_um, w_um, gap_um, t_th, t_dr, target, npml=8):
+    """Gradient of (T_drop − target)² through the normalized port split."""
+    _, jmon = _jsrc_jmon(e_fwd.shape[1], npml, dx_um)
+    th = np.abs(xs + w_um / 2) <= w_um * 0.85
     dr = np.abs(xs - (gap_um + w_um / 2)) <= w_um * 0.85
+    tot = t_th + t_dr + 1e-30
+    dL = 2.0 * (t_dr - target)
     src = np.zeros_like(e_fwd)
-    src[dr, jmon] = (t_dr - target) * e_fwd[dr, jmon]
+    src[dr, jmon] = dL * (t_th / tot) * e_fwd[dr, jmon]
+    src[th, jmon] = dL * (-t_dr / tot) * e_fwd[th, jmon]
     return src
 
 
-def _bicgstab(op, b, tol=2e-3, maxiter=160):
-    x = np.zeros_like(b)
+def _bicgstab(op, b, x0=None, tol=1.5e-3, maxiter=320):
+    x = np.zeros_like(b) if x0 is None else x0.copy()
     r = b - op(x)
     r0 = r.copy()
     rho = alpha = omega = 1.0 + 0j
     v = np.zeros_like(b)
     p = np.zeros_like(b)
     bnorm = np.linalg.norm(b) + 1e-30
+    best = x
+    best_rel = np.linalg.norm(r) / bnorm
     for _ in range(maxiter):
         rho_n = np.vdot(r0, r)
         if abs(rho_n) < 1e-20:
@@ -526,23 +553,29 @@ def _bicgstab(op, b, tol=2e-3, maxiter=160):
         v = op(p)
         den = np.vdot(r0, v)
         if abs(den) < 1e-20:
-            return x, False
+            return best, best_rel < 0.08
         alpha = rho_n / den
         h = x + alpha * p
         s = r - alpha * v
-        if np.linalg.norm(s) / bnorm < tol:
+        rel_s = np.linalg.norm(s) / bnorm
+        if rel_s < best_rel:
+            best, best_rel = h, rel_s
+        if rel_s < tol:
             return h, True
         t = op(s)
         t2 = np.vdot(t, t)
         if abs(t2) < 1e-20:
-            return h, False
+            return best, best_rel < 0.08
         omega = np.vdot(t, s) / t2
         x = h + omega * s
         r = s - omega * t
-        if np.linalg.norm(r) / bnorm < tol:
+        rel = np.linalg.norm(r) / bnorm
+        if rel < best_rel:
+            best, best_rel = x, rel
+        if rel < tol:
             return x, True
         rho = rho_n
-    return x, bool(np.isfinite(x).all() and np.linalg.norm(r) / bnorm < 0.12)
+    return best, bool(np.isfinite(best).all() and best_rel < 0.08)
 
 
 def _drc(binary: np.ndarray, dx_um: float, mfs_nm: float, min_gap_nm: float) -> dict:
