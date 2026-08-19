@@ -256,6 +256,35 @@ const library: { type: DeviceType; label: string }[] = [
   { type: "detector", label: "Detector" },
 ];
 
+function DeviceIcon({ type }: { type: DeviceType }) {
+  return (
+    <span className="lib-icon" aria-hidden="true">
+      {type === "waveguide" ? (
+        <svg viewBox="0 0 16 16">
+          <line x1="1" y1="8" x2="15" y2="8" />
+        </svg>
+      ) : null}
+      {type === "coupler" ? (
+        <svg viewBox="0 0 16 16">
+          <line x1="2" y1="6" x2="14" y2="6" />
+          <line x1="2" y1="10" x2="14" y2="10" />
+        </svg>
+      ) : null}
+      {type === "ring" ? (
+        <svg viewBox="0 0 16 16">
+          <circle cx="8" cy="8" r="4.5" />
+        </svg>
+      ) : null}
+      {type === "detector" ? (
+        <svg viewBox="0 0 16 16">
+          <polygon points="3,3 13,8 3,13" />
+          <line x1="13" y1="4" x2="13" y2="12" />
+        </svg>
+      ) : null}
+    </span>
+  );
+}
+
 let nextId = 1;
 function uid(prefix: string) {
   nextId += 1;
@@ -677,7 +706,19 @@ export default function App() {
   return (
     <div className="app">
       <header className="topbar">
-        <h1>Photonic sensor</h1>
+        <div className="brand">
+          <svg className="logo" viewBox="0 0 32 32" aria-hidden="true">
+            <rect className="logo-bg" x="0" y="0" width="32" height="32" rx="8" />
+            <g className="logo-mark">
+              <line x1="4" y1="16" x2="28" y2="16" />
+              <circle cx="16" cy="16" r="6.5" />
+            </g>
+          </svg>
+          <div className="brand-text">
+            <h1>Photonic sensor</h1>
+            <p>SOI compact models</p>
+          </div>
+        </div>
         <div className="globals">
           <label className="global-field">
             λ (nm)
@@ -687,15 +728,19 @@ export default function App() {
               onChange={(e) => setPlatformField("wavelength_nm", Number(e.target.value))}
             />
           </label>
-          {circuit?.radius_for_laser_um != null ? (
-            <button type="button" onClick={tuneRingToLaser}>
-              Tune ring to λ
-            </button>
-          ) : null}
-          {circuit?.critical ? (
-            <button type="button" onClick={setCriticalCoupling}>
-              Set critical κ
-            </button>
+          {circuit?.radius_for_laser_um != null || circuit?.critical ? (
+            <div className="toolbar-actions">
+              {circuit?.radius_for_laser_um != null ? (
+                <button type="button" onClick={tuneRingToLaser}>
+                  Tune ring to λ
+                </button>
+              ) : null}
+              {circuit?.critical ? (
+                <button type="button" onClick={setCriticalCoupling}>
+                  Set critical κ
+                </button>
+              ) : null}
+            </div>
           ) : null}
           <div className="view-toggle">
             <button
@@ -713,12 +758,13 @@ export default function App() {
               Cross-section
             </button>
           </div>
-          <label className="grid-toggle">
+          <label className="switch">
             <input
               type="checkbox"
               checked={grid}
               onChange={(e) => setGrid(e.target.checked)}
             />
+            <span className="switch-ui" />
             Grid
           </label>
         </div>
@@ -748,8 +794,14 @@ export default function App() {
             <p className="bar-section">Add a part</p>
             <div className="library-list">
               {library.map((item) => (
-                <button key={item.type} type="button" onClick={() => addDevice(item.type)}>
-                  + {item.label}
+                <button
+                  key={item.type}
+                  type="button"
+                  className="lib-item"
+                  onClick={() => addDevice(item.type)}
+                >
+                  <DeviceIcon type={item.type} />
+                  {item.label}
                 </button>
               ))}
             </div>
@@ -1221,6 +1273,12 @@ function CircuitBoard({
   if (devices.length === 0) {
     return (
       <div className="empty-board">
+        <div className="empty-mark">
+          <svg viewBox="0 0 88 56" aria-hidden="true">
+            <line x1="6" y1="40" x2="82" y2="40" />
+            <circle cx="44" cy="24" r="14" />
+          </svg>
+        </div>
         <p>Empty chip</p>
         <p className="muted">Add a part and it will sit in a typical sensor layout.</p>
         <button type="button" className="primary" onClick={onPlaceSensor}>
@@ -1242,7 +1300,7 @@ function CircuitBoard({
         onPointerUp={endDrag}
         onPointerCancel={endDrag}
       >
-        <rect className="chip" x={16} y={16} width={CHIP_W - 32} height={CHIP_H - 32} />
+        <rect className="chip" x={16} y={16} width={CHIP_W - 32} height={CHIP_H - 32} rx={10} />
         <text x={28} y={36}>
           chip
         </text>
@@ -1505,9 +1563,20 @@ function Bar({
     <aside
       className={`bar ${side} ${open ? "open" : "closed"} ${stacked ? "stacked" : ""} ${grow ? "grow" : ""}`}
     >
-      <button type="button" className="bar-toggle" onClick={onToggle}>
+      <button type="button" className="bar-toggle" onClick={onToggle} aria-expanded={open}>
         <span>{title}</span>
-        {open ? <span className="bar-action">Minimize</span> : null}
+        <span className={`bar-chevron ${open ? "open" : ""}`} aria-hidden="true">
+          <svg viewBox="0 0 16 16" width="16" height="16">
+            <path
+              d="M6 3.5 11 8 6 12.5"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.6"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
+          </svg>
+        </span>
       </button>
       {open ? <div className="bar-body">{children}</div> : null}
     </aside>
