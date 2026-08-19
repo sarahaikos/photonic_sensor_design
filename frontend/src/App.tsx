@@ -233,6 +233,7 @@ type TopologyResult = {
   vectorizer: string;
   dx_nm: number;
   beta: number;
+  etas?: { dilated: number; intermediate: number; eroded: number };
   filter_radius_nm: number;
   steps: number;
   kappa_target: number | null;
@@ -241,10 +242,22 @@ type TopologyResult = {
   kappa: number | null;
   grayscale: number;
   drc: TopologyDrc;
-  history: { step: number; objective: number; t_drop: number; beta: number }[];
+  history: {
+    step: number;
+    objective: number;
+    t_drop: number;
+    beta: number;
+    worst?: "dilated" | "intermediate" | "eroded";
+    t_drop_dilated?: number;
+    t_drop_intermediate?: number;
+    t_drop_eroded?: number;
+  }[];
   robust?: {
     dilated?: { t_through: number; t_drop: number };
+    intermediate?: { t_through: number; t_drop: number };
     eroded?: { t_through: number; t_drop: number };
+    worst?: "dilated" | "intermediate" | "eroded";
+    t_drop_worst?: number;
   } | null;
   polygons: { x: number; y: number }[][];
   polygon_count: number;
@@ -1759,6 +1772,94 @@ function Field({
   );
 }
 
+function topologyObjectiveNote(report: TopologyResult): string {
+  const h = report.history;
+  const first = h[0];
+  const last = h[h.length - 1];
+  const target = report.kappa_target;
+  const start = first.objective;
+  const end = last.objective;
+  const ratio = end / (Math.abs(start) > 1e-12 ? start : 1e-12);
+  let trend: string;
+  if (end < 1e-4) {
+    trend = `ended near zero (${fmt(end, 4)}), so the worst blueprint is on the κ target`;
+  } else if (ratio < 0.7) {
+    trend = `fell from ${fmt(start, 3)} to ${fmt(end, 3)}, so the worst blueprint moved closer to the target`;
+  } else if (ratio > 1.2) {
+    trend = `rose from ${fmt(start, 3)} to ${fmt(end, 3)}; the worst-case split did not improve`;
+  } else {
+    trend = `stayed near ${fmt(end, 3)}; the worst-case error barely moved`;
+  }
+  const counts = { dilated: 0, intermediate: 0, eroded: 0 };
+  for (const step of h) {
+    if (step.worst) counts[step.worst] += 1;
+  }
+  const counted = (Object.entries(counts) as [keyof typeof counts, number][]).filter(
+    ([, n]) => n > 0
+  );
+  const who =
+    counted.length > 0
+      ? ` The adjoint used ${counted.map(([name, n]) => `${name} on ${n} step${n === 1 ? "" : "s"}`).join(", ")}.`
+      : "";
+  const tgt = target != null ? ` Target κ is ${fmt(target, 2)}.` : "";
+  const lastWorst = last.worst ? ` Last update was the ${last.worst} geometry.` : "";
+  return `Each point is the largest (T_drop − κ)² among dilated / intermediate / eroded, plus a small grayscale penalty on the intended layout.${tgt} The curve ${trend}.${who}${lastWorst}`;
+}
+
+function topologyTDropNote(
+  report: TopologyResult,
+  etas: { dilated: number; intermediate: number; eroded: number }
+): string {
+  const last = report.history[report.history.length - 1];
+  const d = last.t_drop_dilated;
+  const m = last.t_drop_intermediate;
+  const e = last.t_drop_eroded;
+  if (d == null || m == null || e == null) return "";
+  const target = report.kappa_target ?? 0.5;
+  const rows: [string, number][] = [
+    ["dilated", d],
+    ["intermediate", m],
+    ["eroded", e],
+  ];
+  const farthest = rows.reduce((a, b) =>
+    Math.abs(b[1] - target) > Math.abs(a[1] - target) ? b : a
+  );
+  const spread = Math.abs(d - e);
+  const final = report.robust;
+  const finalBit =
+    final?.dilated && final?.eroded
+      ? ` On the finished layout, T_drop is ${fmt(final.dilated.t_drop, 3)} dilated and ${fmt(final.eroded.t_drop, 3)} eroded${final.worst ? ` (${final.worst} is worst)` : ""}.`
+      : "";
+  const spreadBit =
+    spread < 0.05
+      ? ` Dilated and eroded stay within ${fmt(spread, 3)}, so the split is fairly stable to over/under-etch.`
+      : ` Dilated and eroded differ by ${fmt(spread, 3)}; bias still moves the split.`;
+  return `The three traces are the same filtered density with η = ${fmt(etas.dilated, 2)} (features grow), ${fmt(etas.intermediate, 2)} (intended chip), and ${fmt(etas.eroded, 2)} (features shrink). Target κ is ${fmt(target, 2)}. Last step: dilated ${fmt(d, 3)}, intermediate ${fmt(m, 3)}, eroded ${fmt(e, 3)}. ${farthest[0]} is farthest from the target (|Δκ| = ${fmt(Math.abs(farthest[1] - target), 3)}).${spreadBit}${finalBit}`;
+}
+
+function topologyDensityNote(
+  report: TopologyResult,
+  etas: { dilated: number; intermediate: number; eroded: number }
+): string {
+  const gray = report.grayscale;
+  const fillPct = report.drc.fill * 100;
+  const grayBit =
+    gray < 0.08
+      ? `Little leftover gray (${fmt(gray, 3)}), so most pixels are binary Si or clad.`
+      : `Grayscale is still ${fmt(gray, 3)}; some pixels are neither fully Si nor clad.`;
+  const mfs = report.drc.mfs_ok
+    ? `min feature ${fmt(report.drc.min_feature_nm, 0)} nm meets the ${fmt(report.drc.mfs_nm, 0)} nm DUV rule`
+    : `min feature ${fmt(report.drc.min_feature_nm, 0)} nm is below the ${fmt(report.drc.mfs_nm, 0)} nm DUV MFS`;
+  const gap = report.drc.gap_ok
+    ? `min gap ${fmt(report.drc.min_gap_meas_nm, 0)} nm is OK`
+    : `min gap ${fmt(report.drc.min_gap_meas_nm, 0)} nm is below the ${fmt(report.drc.min_gap_nm, 0)} nm rule`;
+  const t =
+    report.t_drop != null
+      ? ` Intermediate T_drop is ${fmt(report.t_drop, 3)}.`
+      : "";
+  return `Dark is silicon after Helmholtz filtering, tanh projection at η = ${fmt(etas.intermediate, 2)} (the layout you would write), and litho/etch bias. Fill is ${fmt(fillPct, 0)}%. ${grayBit} ${mfs}; ${gap}.${t} ${report.polygon_count} polygon${report.polygon_count === 1 ? "" : "s"} in the GDS.`;
+}
+
 function TopologyPanel({
   report,
   busy,
@@ -1768,12 +1869,15 @@ function TopologyPanel({
   busy: boolean;
   onRun: () => void;
 }) {
+  const etas = report?.etas ?? { dilated: 0.3, intermediate: 0.5, eroded: 0.7 };
   return (
     <>
       <p className="muted">
         Density TO of the coupler: Helmholtz filter and tanh projection for DUV min
-        feature size, then litho/etch bias and GDS polygons. Same 2.5D strip as FDTD —
-        not a 3D ring solve.
+        feature size. Each step uses the worst κ error of dilated / intermediate /
+        eroded (η = {fmt(etas.dilated, 2)} / {fmt(etas.intermediate, 2)} /{" "}
+        {fmt(etas.eroded, 2)}; Piggott / Wang), then litho/etch bias and GDS. Same 2.5D
+        strip as FDTD — not a 3D ring solve.
       </p>
       <button type="button" onClick={onRun} disabled={busy}>
         {busy ? "Running topology…" : "Run topology"}
@@ -1783,7 +1887,11 @@ function TopologyPanel({
           <div className="metrics">
             <Metric label="Δx" value={`${fmt(report.dx_nm, 0)} nm`} />
             <Metric label="β" value={fmt(report.beta, 1)} />
-            <Metric label="T_drop" value={fmt(report.t_drop, 3)} />
+            <Metric
+              label="η dilated / mid / eroded"
+              value={`${fmt(etas.dilated, 2)} / ${fmt(etas.intermediate, 2)} / ${fmt(etas.eroded, 2)}`}
+            />
+            <Metric label={`T_drop (η=${fmt(etas.intermediate, 2)})`} value={fmt(report.t_drop, 3)} />
             <Metric label="Gray" value={fmt(report.grayscale, 3)} />
             <Metric
               label="MFS"
@@ -1799,18 +1907,24 @@ function TopologyPanel({
             {report.filter}. {report.projection}. {report.vectorizer}.{" "}
             {report.fabrication}.
           </p>
-          {report.robust?.dilated || report.robust?.eroded ? (
+          {report.robust?.dilated || report.robust?.eroded || report.robust?.intermediate ? (
             <div className="metrics">
               {report.robust?.dilated ? (
                 <Metric
-                  label="Dilated T_drop"
+                  label={`Dilated T_drop (η=${fmt(etas.dilated, 2)})`}
                   value={fmt(report.robust.dilated.t_drop, 3)}
                 />
               ) : null}
               {report.robust?.eroded ? (
                 <Metric
-                  label="Eroded T_drop"
+                  label={`Eroded T_drop (η=${fmt(etas.eroded, 2)})`}
                   value={fmt(report.robust.eroded.t_drop, 3)}
+                />
+              ) : null}
+              {report.robust?.t_drop_worst != null ? (
+                <Metric
+                  label={`Worst T_drop (${report.robust.worst ?? "—"})`}
+                  value={fmt(report.robust.t_drop_worst, 3)}
                 />
               ) : null}
             </div>
@@ -1821,21 +1935,58 @@ function TopologyPanel({
             </button>
           ) : null}
           {report.history.length > 1 ? (
-            <LinePlot
-              title="TO objective"
-              xLabel="Step"
-              yLabel="(T_drop − target)²"
-              x={report.history.map((h) => h.step)}
-              series={[
-                {
-                  name: "objective",
-                  y: report.history.map((h) => h.objective),
-                  kind: "through",
-                },
-              ]}
-              yAuto
-              xDigits={0}
-            />
+            <>
+              <LinePlot
+                title="Worst-case TO objective"
+                xLabel="Step"
+                yLabel="max (T_drop − target)²"
+                x={report.history.map((h) => h.step)}
+                series={[
+                  {
+                    name: "worst κ error",
+                    y: report.history.map((h) => h.objective),
+                    kind: "through",
+                  },
+                ]}
+                yAuto
+                xDigits={0}
+                note={topologyObjectiveNote(report)}
+                noteLabel="Objective"
+              />
+              {report.history.every(
+                (h) =>
+                  h.t_drop_dilated != null &&
+                  h.t_drop_intermediate != null &&
+                  h.t_drop_eroded != null
+              ) ? (
+                <LinePlot
+                  title="T_drop dilated / intermediate / eroded"
+                  xLabel="Step"
+                  yLabel="T_drop"
+                  x={report.history.map((h) => h.step)}
+                  series={[
+                    {
+                      name: "dilated",
+                      y: report.history.map((h) => h.t_drop_dilated as number),
+                      kind: "drop",
+                    },
+                    {
+                      name: "intermediate",
+                      y: report.history.map((h) => h.t_drop_intermediate as number),
+                      kind: "through",
+                    },
+                    {
+                      name: "eroded",
+                      y: report.history.map((h) => h.t_drop_eroded as number),
+                      kind: "mid",
+                    },
+                  ]}
+                  xDigits={0}
+                  note={topologyTDropNote(report, etas)}
+                  noteLabel="T_drop"
+                />
+              ) : null}
+            </>
           ) : null}
           {report.field ? (
             <Heatmap
@@ -1843,6 +1994,8 @@ function TopologyPanel({
               xLabel="y (μm)"
               yLabel="x (μm)"
               field={report.field}
+              note={topologyDensityNote(report, etas)}
+              noteLabel="Projected density"
             />
           ) : null}
         </>
@@ -1931,6 +2084,28 @@ function Metric({ label, value }: { label: string; value: string | number }) {
     <div className="metric">
       <span>{label}</span>
       <strong>{value}</strong>
+    </div>
+  );
+}
+
+function PlotNoteCard({ label, note }: { label: string; note?: string }) {
+  if (!note) return null;
+  const bits = note
+    .split(/(?<=\.)\s+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return (
+    <div className="metric plot-note-card">
+      <span>{label}</span>
+      {bits.length > 1 ? (
+        <ul>
+          {bits.map((bit) => (
+            <li key={bit}>{bit}</li>
+          ))}
+        </ul>
+      ) : (
+        <strong>{note}</strong>
+      )}
     </div>
   );
 }
@@ -2037,11 +2212,15 @@ function Heatmap({
   xLabel,
   yLabel,
   field,
+  note,
+  noteLabel = "Reading",
 }: {
   title: string;
   xLabel: string;
   yLabel: string;
   field: FieldMap;
+  note?: string;
+  noteLabel?: string;
 }) {
   const x = field.x_nm ?? field.x_um ?? [];
   const y = field.y_nm ?? field.z_um ?? [];
@@ -2141,6 +2320,7 @@ function Heatmap({
           {yLabel}
         </text>
       </svg>
+      <PlotNoteCard label={noteLabel} note={note} />
     </div>
   );
 }
@@ -2155,16 +2335,20 @@ function LinePlot({
   markX,
   xDigits,
   yAuto = false,
+  note,
+  noteLabel = "Reading",
 }: {
   title: string;
   xLabel: string;
   yLabel: string;
   x: number[];
-  series: { name: string; y: number[]; kind: "through" | "drop" }[];
+  series: { name: string; y: number[]; kind: "through" | "drop" | "mid" }[];
   db?: boolean;
   markX?: number;
   xDigits?: number;
   yAuto?: boolean;
+  note?: string;
+  noteLabel?: string;
 }) {
   if (!x.length || !series[0]?.y.length) return null;
   const width = 640;
@@ -2247,6 +2431,7 @@ function LinePlot({
           </span>
         ))}
       </p>
+      <PlotNoteCard label={noteLabel} note={note} />
     </div>
   );
 }

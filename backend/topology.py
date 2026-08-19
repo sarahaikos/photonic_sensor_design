@@ -12,6 +12,9 @@ import numpy as np
 from fdtd.geometry import Rect, Scene
 from waveguide import analyze_waveguide
 
+# Dilated / intermediate / eroded thresholds. Wang, Lazarov & Sigmund 2011.
+_ROBUST_ETAS = (("dilated", 0.3), ("intermediate", 0.5), ("eroded", 0.7))
+
 
 def run_topology(
     width_nm: float,
@@ -72,13 +75,12 @@ def run_topology(
         )
 
     rho_f = helmholtz_filter(rho, r_px)
-    nominal = tanh_project(rho_f, beta, 0.5)
-    dilated = tanh_project(rho_f, beta, 0.3)
-    eroded = tanh_project(rho_f, beta, 0.7)
-    if design.any():
-        nominal = np.where(design, nominal, rho0)
-        dilated = np.where(design, dilated, rho0)
-        eroded = np.where(design, eroded, rho0)
+    variants = {
+        name: _project_design(rho_f, design, rho0, beta, eta) for name, eta in _ROBUST_ETAS
+    }
+    nominal = variants["intermediate"]
+    dilated = variants["dilated"]
+    eroded = variants["eroded"]
     fabricated = litho_etch_surrogate(nominal, etch_nm / (dx_um * 1e3), rounding_nm / (dx_um * 1e3))
     if design.any():
         fabricated = np.where(design, fabricated, nominal)
@@ -91,18 +93,22 @@ def run_topology(
     gds = write_gdsii(polys, cell="TO_COUPLER", layer=1)
 
     robust = None
-    if gap_um is not None and t_th is not None:
+    if gap_um is not None:
         robust = _robust_splits(
-            dilated, eroded, xs, ys, dx_um, n_core, n_bg, wavelength_nm, w_um, gap_um
+            variants, xs, ys, dx_um, n_core, n_bg, wavelength_nm, w_um, gap_um, target
         )
+        if robust and "intermediate" in robust:
+            t_th = robust["intermediate"]["t_through"]
+            t_dr = robust["intermediate"]["t_drop"]
 
     return {
         "filter": "Helmholtz PDE (Lazarov 2011)",
-        "projection": "tanh / Heaviside (Wang 2011)",
-        "fabrication": "morphological litho-etch surrogate (not SEM-trained)",
+        "projection": "tanh / Heaviside, robust dilated–eroded (Wang 2011)",
+        "fabrication": "worst-case dilated/eroded κ in the loop (Piggott 2015; Wang 2011); morphological litho-etch after (not SEM-trained)",
         "vectorizer": "marching squares + Ramer–Douglas–Peucker",
         "dx_nm": dx_um * 1e3,
         "beta": beta,
+        "etas": {name: eta for name, eta in _ROBUST_ETAS},
         "filter_radius_nm": r_px * dx_um * 1e3,
         "steps": steps,
         "kappa_target": target if gap_um is not None else None,
@@ -318,6 +324,11 @@ def _seed_swg(rho: np.ndarray, design: np.ndarray, ys: np.ndarray, dx_um: float)
     return out
 
 
+def _project_design(rho_f, design, rho_fixed, beta, eta):
+    rho_p = tanh_project(rho_f, beta, eta)
+    return np.where(design, rho_p, rho_fixed) if design.any() else rho_p
+
+
 def _optimize(
     rho,
     design,
@@ -334,52 +345,92 @@ def _optimize(
     gap_um,
     target,
 ):
+    """Piggott / Wang robust step: worst κ error of dilated, intermediate, eroded."""
     history = []
     field_ez = None
     t_th = t_dr = None
-    beta = 1.0
     for k in range(steps):
         beta = min(beta_final, 1.0 * (1.35**k))
         rho_f = helmholtz_filter(rho, r_px)
-        rho_p = tanh_project(rho_f, beta, 0.5)
-        rho_p = np.where(design, rho_p, rho)
-        split, e_fwd, ok = _fdfd_split(rho_p, xs, ys, dx_um, n_core, n_bg, wavelength_nm, w_um, gap_um)
-        if not ok or split is None:
+        candidates = []
+        for name, eta in _ROBUST_ETAS:
+            rho_p = _project_design(rho_f, design, rho, beta, eta)
+            split, e_fwd, ok = _fdfd_split(
+                rho_p, xs, ys, dx_um, n_core, n_bg, wavelength_nm, w_um, gap_um
+            )
+            if not ok or split is None:
+                continue
+            t_drop = float(split[1])
+            candidates.append(
+                {
+                    "name": name,
+                    "eta": eta,
+                    "rho_p": rho_p,
+                    "split": split,
+                    "e_fwd": e_fwd,
+                    "t_drop": t_drop,
+                    "err": (t_drop - target) ** 2,
+                }
+            )
+        if not candidates:
             break
-        t_th, t_dr = split
-        gray = _grayscale(rho_p)
-        obj = (t_dr - target) ** 2 + 0.08 * gray
-        history.append(
-            {"step": k + 1, "objective": float(obj), "t_drop": float(t_dr), "beta": float(beta)}
+        worst = max(candidates, key=lambda c: c["err"])
+        by_name = {c["name"]: c for c in candidates}
+        mid = by_name.get("intermediate", worst)
+        t_th, t_dr = mid["split"]
+        gray = _grayscale(mid["rho_p"])
+        obj = worst["err"] + 0.08 * gray
+        rec = {
+            "step": k + 1,
+            "objective": float(obj),
+            "t_drop": float(worst["t_drop"]),
+            "worst": worst["name"],
+            "beta": float(beta),
+        }
+        for name, _eta in _ROBUST_ETAS:
+            if name in by_name:
+                rec[f"t_drop_{name}"] = by_name[name]["t_drop"]
+        history.append(rec)
+        dL_dE = _adjoint_source(worst["e_fwd"], xs, w_um, gap_um, worst["t_drop"], target)
+        e_adj, aok = _fdfd_solve(
+            worst["rho_p"], xs, ys, dx_um, n_core, n_bg, wavelength_nm, -dL_dE
         )
-        dL_dE = _adjoint_source(e_fwd, xs, w_um, gap_um, t_dr, target)
-        e_adj, aok = _fdfd_solve(rho_p, xs, ys, dx_um, n_core, n_bg, wavelength_nm, -dL_dE)
+        if mid["e_fwd"] is not None:
+            field_ez = _ez_field(xs, ys, mid["e_fwd"])
         if not aok or not np.isfinite(e_adj).all():
-            if e_fwd is not None:
-                field_ez = _ez_field(xs, ys, e_fwd)
             continue
         k0 = 2 * math.pi / (wavelength_nm * 1e-3)
         deps = n_core**2 - n_bg**2
-        sens = np.real(e_fwd * e_adj) * (k0**2) * deps
-        sens *= project_grad(rho_f, beta, 0.5)
+        sens = np.real(worst["e_fwd"] * e_adj) * (k0**2) * deps
+        sens *= project_grad(rho_f, beta, worst["eta"])
         sens = helmholtz_filter(sens, r_px)
         sens *= design
         scale = float(np.max(np.abs(sens))) or 1.0
         updated = np.clip(rho - 0.08 * sens / scale, 0.0, 1.0)
         rho = np.where(design, updated, rho)
-        if e_fwd is not None:
-            field_ez = _ez_field(xs, ys, e_fwd)
     return rho, history, t_th, t_dr, field_ez
 
 
-def _robust_splits(dilated, eroded, xs, ys, dx_um, n_core, n_bg, wavelength_nm, w_um, gap_um):
-    d, _, ok_d = _fdfd_split(dilated, xs, ys, dx_um, n_core, n_bg, wavelength_nm, w_um, gap_um)
-    e, _, ok_e = _fdfd_split(eroded, xs, ys, dx_um, n_core, n_bg, wavelength_nm, w_um, gap_um)
+def _robust_splits(
+    variants, xs, ys, dx_um, n_core, n_bg, wavelength_nm, w_um, gap_um, target
+):
     out = {}
-    if ok_d and d:
-        out["dilated"] = {"t_through": d[0], "t_drop": d[1]}
-    if ok_e and e:
-        out["eroded"] = {"t_through": e[0], "t_drop": e[1]}
+    worst_name = None
+    worst_err = -1.0
+    for name, rho_p in variants.items():
+        split, _, ok = _fdfd_split(
+            rho_p, xs, ys, dx_um, n_core, n_bg, wavelength_nm, w_um, gap_um
+        )
+        if not ok or not split:
+            continue
+        out[name] = {"t_through": split[0], "t_drop": split[1]}
+        err = (split[1] - target) ** 2
+        if err >= worst_err:
+            worst_err = err
+            worst_name = name
+    if worst_name:
+        out["worst"] = worst_name
+        out["t_drop_worst"] = out[worst_name]["t_drop"]
     return out or None
 
 

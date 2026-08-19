@@ -947,6 +947,49 @@ label {
   margin-bottom: 16px;
 }
 
+.plot-note-card {
+  margin-top: 8px;
+  padding: 12px 14px 12px 12px;
+  gap: 8px;
+  border-left: 3px solid var(--accent-line);
+  background: var(--glass-strong);
+}
+
+.plot-note-card strong,
+.plot-note-card li {
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: 0;
+  font-variant-numeric: normal;
+  line-height: 1.5;
+  color: var(--ink-2);
+  overflow-wrap: break-word;
+}
+
+.plot-note-card ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 6px;
+}
+
+.plot-note-card li {
+  padding-left: 12px;
+  position: relative;
+}
+
+.plot-note-card li::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0.55em;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
 .plot line.guide {
   stroke: var(--accent);
   stroke-dasharray: 3 3;
@@ -1000,6 +1043,13 @@ label {
 .legend .drop {
   stroke: var(--drop);
   color: var(--drop);
+}
+
+.plot path.mid,
+.legend .mid {
+  stroke: var(--accent);
+  color: var(--accent);
+  stroke-dasharray: 5 4;
 }
 
 .legend {
