@@ -1,0 +1,573 @@
+:root {
+  font-family: Inter, system-ui, sans-serif;
+  color: #1c1c1c;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+.app {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 8px 12px;
+  border-bottom: 1px solid #ddd;
+  background: #fff;
+}
+
+.topbar h1 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.globals {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.global-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: #444;
+}
+
+.global-field input {
+  width: 88px;
+}
+
+.grid-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: #444;
+}
+
+.view-toggle {
+  display: flex;
+  gap: 0;
+}
+
+.view-toggle button {
+  border-radius: 0;
+  cursor: pointer;
+}
+
+.view-toggle button.active {
+  background: #1c1c1c;
+  color: #fff;
+  border-color: #1c1c1c;
+}
+
+.workspace {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
+.left-stack {
+  display: flex;
+  flex-direction: column;
+  min-width: 40px;
+  background: #fff;
+  border-right: 1px solid #ddd;
+}
+
+.left-stack.open {
+  width: 280px;
+}
+
+.left-stack.closed {
+  width: 40px;
+}
+
+.left-stack .bar {
+  border-right: none;
+  min-width: 0;
+  width: auto;
+}
+
+.left-stack .bar.grow.open {
+  flex: 1;
+  min-height: 0;
+}
+
+.left-stack.closed .bar {
+  flex: 1;
+}
+
+.left-stack.closed .bar-toggle {
+  writing-mode: vertical-rl;
+  transform: rotate(180deg);
+  flex: 1;
+  border-bottom: none;
+}
+
+.left-stack.open .bar.stacked.closed {
+  flex: 0 0 auto;
+}
+
+.left-stack.open .bar.stacked.closed .bar-toggle {
+  writing-mode: horizontal-tb;
+  transform: none;
+  flex: none;
+}
+
+.bar {
+  display: flex;
+  flex-direction: column;
+  background: #fff;
+  border-right: 1px solid #ddd;
+  min-width: 40px;
+}
+
+.bar.right {
+  border-right: none;
+  border-left: 1px solid #ddd;
+}
+
+.bar.open {
+  width: 280px;
+}
+
+.bar.stacked.open,
+.bar.stacked.closed {
+  width: auto;
+}
+
+.bar.right.open {
+  width: 380px;
+}
+
+.bar-toggle {
+  margin: 0;
+  padding: 10px 12px;
+  border: none;
+  border-radius: 0;
+  background: #fff;
+  color: #1c1c1c;
+  cursor: pointer;
+  text-align: left;
+  font-size: 13px;
+  border-bottom: 1px solid #eee;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+
+.bar-action {
+  font-size: 12px;
+  color: #777;
+  font-weight: 400;
+}
+
+.bar.closed .bar-toggle {
+  writing-mode: vertical-rl;
+  transform: rotate(180deg);
+  border-bottom: none;
+  flex: 1;
+}
+
+.bar-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 12px;
+}
+
+.bar-section {
+  margin: 0 0 10px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: #666;
+  text-transform: uppercase;
+}
+
+.bar-body > .bar-section:not(:first-child) {
+  margin-top: 20px;
+}
+
+.board {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #f7f7f4;
+  overflow: auto;
+}
+
+.board.grid {
+  background-image:
+    linear-gradient(#e6e6e2 1px, transparent 1px),
+    linear-gradient(90deg, #e6e6e2 1px, transparent 1px);
+  background-size: 24px 24px;
+  background-color: #f7f7f4;
+}
+
+.empty-board {
+  text-align: center;
+  padding: 24px;
+  display: grid;
+  gap: 8px;
+  justify-items: center;
+}
+
+.empty-board p {
+  margin: 0 0 8px;
+  font-size: 16px;
+}
+
+.empty-board .muted {
+  margin-bottom: 12px;
+}
+
+.board-stage {
+  display: grid;
+  justify-items: center;
+  gap: 8px;
+  width: min(920px, 94%);
+}
+
+.board-hint {
+  margin: 0;
+  font-size: 12px;
+  color: #777;
+}
+
+.circuit-svg {
+  width: 100%;
+  height: auto;
+  max-height: 420px;
+  overflow: visible;
+  touch-action: none;
+  user-select: none;
+}
+
+.circuit-svg.dragging {
+  cursor: grabbing;
+}
+
+.circuit-svg .chip {
+  fill: #fbfbf8;
+  stroke: #d4d4ce;
+  stroke-width: 1;
+}
+
+.circuit-svg .bus,
+.circuit-svg .device-line {
+  fill: none;
+  stroke: #1c1c1c;
+  stroke-width: 2.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.circuit-svg .hit {
+  fill: none;
+  stroke: transparent;
+  stroke-width: 18;
+}
+
+.circuit-svg .hit-fill {
+  fill: transparent;
+  stroke: none;
+}
+
+.circuit-svg .halo {
+  fill: none;
+  stroke: #1c1c1c;
+  stroke-width: 1;
+  stroke-dasharray: 3 2;
+  opacity: 0.4;
+}
+
+.circuit-svg .seg {
+  cursor: grab;
+}
+
+.circuit-svg.dragging .seg {
+  cursor: grabbing;
+}
+
+.circuit-svg .seg.selected .device-line,
+.circuit-svg .seg.selected .bus,
+.circuit-svg .seg.selected .detector {
+  stroke-width: 3;
+}
+
+.circuit-svg .io {
+  font-size: 10px;
+  fill: #999;
+}
+
+.circuit-svg .detector {
+  fill: #d8d8d4;
+  stroke: #1c1c1c;
+  stroke-width: 2;
+}
+
+.circuit-svg .handle {
+  fill: #fff;
+  stroke: #1c1c1c;
+  stroke-width: 2;
+  cursor: pointer;
+}
+
+.circuit-svg text,
+.circuit-svg .caption {
+  font-size: 11px;
+  fill: #666;
+}
+
+button.danger {
+  margin-top: 8px;
+  background: #fff;
+  color: #9b1c1c;
+  border-color: #d8a0a0;
+  cursor: pointer;
+}
+
+form,
+.prop-block {
+  display: grid;
+  gap: 12px;
+}
+
+.library-list {
+  display: grid;
+  gap: 6px;
+}
+
+.library-list button {
+  text-align: left;
+  cursor: pointer;
+  background: #fff;
+  color: #1c1c1c;
+  width: 100%;
+}
+
+.library-list button:hover {
+  background: #f0f0ec;
+}
+
+.library-list button.primary,
+button.primary {
+  text-align: center;
+  cursor: pointer;
+  background: #1c1c1c;
+  color: #fff;
+  border-color: #1c1c1c;
+}
+
+label {
+  display: grid;
+  gap: 4px;
+  font-size: 13px;
+  color: #444;
+}
+
+input,
+select,
+button {
+  font: inherit;
+  padding: 8px 10px;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  background: #fff;
+}
+
+button[type="submit"] {
+  margin-top: 4px;
+  cursor: pointer;
+  background: #1c1c1c;
+  color: #fff;
+  border-color: #1c1c1c;
+}
+
+.error {
+  color: #9b1c1c;
+  font-size: 13px;
+}
+
+.muted {
+  color: #777;
+  font-size: 13px;
+}
+
+.metrics {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin: 0 0 20px;
+}
+
+.metric {
+  display: grid;
+  gap: 2px;
+}
+
+.metric span {
+  font-size: 11px;
+  color: #666;
+}
+
+.metric strong {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.schematic {
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  touch-action: none;
+}
+
+.plot {
+  width: 100%;
+  height: auto;
+  background: #fafafa;
+  border: 1px solid #eee;
+}
+
+.schematic circle,
+.schematic line {
+  fill: none;
+  stroke: #1c1c1c;
+  stroke-width: 3;
+}
+
+.schematic line.guide {
+  stroke: #888;
+  stroke-width: 1;
+}
+
+.schematic .hit {
+  fill: none;
+  stroke: transparent;
+  stroke-width: 16;
+  cursor: nwse-resize;
+}
+
+.schematic .handle {
+  fill: #fff;
+  stroke: #1c1c1c;
+  stroke-width: 2;
+  cursor: ew-resize;
+}
+
+.field-plot {
+  position: relative;
+  width: 100%;
+}
+
+.field-canvas {
+  display: block;
+  background: #0c0c10;
+}
+
+.field-axes {
+  display: block;
+  width: 100%;
+  height: auto;
+  background: #fff;
+  border: 1px solid #eee;
+}
+
+.field-axes text {
+  fill: #555;
+}
+
+.field-core {
+  fill: none;
+  stroke: #1c1c1c;
+  stroke-width: 1;
+}
+
+.schematic .core.field-on {
+  fill: none;
+}
+
+.plot-block {
+  margin-bottom: 16px;
+}
+
+.plot line.guide {
+  stroke: #888;
+  stroke-dasharray: 3 3;
+  stroke-width: 1;
+}
+
+.schematic .box {
+  fill: #ecece8;
+  stroke: #1c1c1c;
+  stroke-width: 2;
+}
+
+.schematic .clad {
+  fill: #f3f6f8;
+  stroke: none;
+}
+
+.schematic .handle-box {
+  fill: #fff;
+  stroke: #1c1c1c;
+  stroke-width: 2;
+  cursor: nwse-resize;
+}
+
+.schematic text,
+.plot text {
+  font-size: 12px;
+  fill: #555;
+}
+
+.plot line {
+  stroke: #bbb;
+}
+
+.plot path {
+  fill: none;
+  stroke-width: 2;
+}
+
+.plot path.through,
+.legend .through {
+  stroke: #1c1c1c;
+  color: #1c1c1c;
+}
+
+.plot path.drop,
+.legend .drop {
+  stroke: #2a6f97;
+  color: #2a6f97;
+}
+
+.legend {
+  display: flex;
+  gap: 16px;
+  font-size: 13px;
+  margin: 8px 0 0;
+}

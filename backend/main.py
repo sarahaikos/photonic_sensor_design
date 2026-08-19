@@ -1,0 +1,112 @@
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+from circuit import analyze_circuit
+from coupler import analyze_coupler
+from detector import analyze_detector
+from fdtd.setup import run_fdtd
+from ring import analyze_ring
+from waveguide import analyze_waveguide
+
+app = FastAPI(title="Photonic Sensor Design")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+class RingInput(BaseModel):
+    radius_um: float = Field(gt=0)
+    wavelength_nm: float = Field(gt=0)
+    n_eff: float = Field(gt=0)
+    n_g: float = Field(gt=0)
+    kappa: float = Field(ge=0, lt=1)
+    loss_db_per_cm: float = Field(ge=0)
+    dn_eff_dn: float = Field(ge=0, le=1)
+    config: str = Field(pattern="^(all-pass|add-drop)$")
+    width_nm: float = Field(default=450.0, gt=0)
+    polarization: str = Field(default="TE", pattern="^(TE|TM)$")
+
+
+class WaveguideInput(BaseModel):
+    width_nm: float = Field(gt=0)
+    height_nm: float = Field(gt=0)
+    wavelength_nm: float = Field(gt=0)
+    n_clad: float = Field(gt=0)
+    polarization: str = Field(pattern="^(TE|TM)$")
+    length_um: float = Field(default=100.0, gt=0)
+
+
+class CouplerInput(BaseModel):
+    gap_nm: float = Field(gt=0)
+    length_um: float = Field(gt=0)
+    width_nm: float = Field(gt=0)
+    wavelength_nm: float = Field(gt=0)
+    polarization: str = Field(pattern="^(TE|TM)$")
+    height_nm: float = Field(default=220.0, gt=0)
+
+
+class DetectorInput(BaseModel):
+    wavelength_nm: float = Field(gt=0)
+    optical_power_uw: float = Field(gt=0)
+    responsivity_a_per_w: float = Field(gt=0)
+    dark_current_na: float = Field(ge=0)
+    bandwidth_mhz: float = Field(gt=0)
+    load_ohm: float = Field(gt=0)
+
+
+@app.post("/api/ring")
+def ring(payload: RingInput):
+    return analyze_ring(**payload.model_dump())
+
+
+@app.post("/api/waveguide")
+def waveguide(payload: WaveguideInput):
+    result = analyze_waveguide(**payload.model_dump())
+    if result is None:
+        raise HTTPException(status_code=400, detail="No guided mode for this cross-section")
+    return result
+
+
+@app.post("/api/coupler")
+def coupler(payload: CouplerInput):
+    return analyze_coupler(**payload.model_dump())
+
+
+@app.post("/api/detector")
+def detector(payload: DetectorInput):
+    return analyze_detector(**payload.model_dump())
+
+
+class CircuitInput(BaseModel):
+    width_nm: float = Field(gt=0)
+    height_nm: float = Field(gt=0)
+    wavelength_nm: float = Field(gt=0)
+    n_clad: float = Field(gt=0)
+    polarization: str = Field(pattern="^(TE|TM)$")
+    devices: list[dict] = Field(default_factory=list)
+    input_power_uw: float = Field(default=10.0, gt=0)
+
+
+@app.post("/api/circuit")
+def circuit(payload: CircuitInput):
+    result = analyze_circuit(**payload.model_dump())
+    if result.get("error"):
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
+
+
+@app.post("/api/fdtd")
+def fdtd(payload: CircuitInput):
+    return run_fdtd(
+        payload.width_nm,
+        payload.height_nm,
+        payload.wavelength_nm,
+        payload.n_clad,
+        payload.polarization,
+        payload.devices,
+    )
