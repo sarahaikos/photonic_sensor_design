@@ -535,6 +535,7 @@ export default function App() {
   const [mode, setMode] = useState<ModeResult | null>(null);
   const [circuit, setCircuit] = useState<CircuitResult | null>(null);
   const [error, setError] = useState("");
+  const [solveStatus, setSolveStatus] = useState<"solving" | "ready" | "error">("solving");
   const [grid, setGrid] = useState(true);
   const [view, setView] = useState<BoardView>("top");
   const [libraryOpen, setLibraryOpen] = useState(true);
@@ -667,6 +668,7 @@ export default function App() {
   useEffect(() => {
     const controller = new AbortController();
     const timer = window.setTimeout(async () => {
+      setSolveStatus("solving");
       try {
         const pin = devices.find((d): d is DetectorDevice => d.type === "detector");
         const res = await fetch("/api/circuit", {
@@ -683,16 +685,19 @@ export default function App() {
           setMode(null);
           setCircuit(null);
           setError("No guided mode for this cross-section.");
+          setSolveStatus("error");
           return;
         }
         const data = (await res.json()) as CircuitResult;
         setCircuit(data);
         setMode(data.mode);
         setError("");
+        setSolveStatus("ready");
         setFdtdRun(null);
       } catch (err) {
         if (err instanceof DOMException && err.name === "AbortError") return;
         setError("Could not reach the Python backend. Start it on port 8000.");
+        setSolveStatus("error");
       }
     }, 120);
     return () => {
@@ -720,6 +725,17 @@ export default function App() {
           </div>
         </div>
         <div className="globals">
+          <p className={`solve-status ${solveStatus}`} role="status">
+            {solveStatus === "solving"
+              ? "Solving…"
+              : solveStatus === "ready"
+                ? "Up to date"
+                : error.includes("Could not reach")
+                  ? "Backend unreachable"
+                  : error.includes("No guided mode")
+                    ? "No guided mode"
+                    : error || "Error"}
+          </p>
           <label className="global-field">
             λ (nm)
             <input
@@ -1049,51 +1065,63 @@ export default function App() {
           open={resultsOpen}
           onToggle={() => setResultsOpen((v) => !v)}
         >
-          <p className="muted">
-            Click a part to edit it. These results are always the full circuit.
-          </p>
+          {!circuit && solveStatus === "solving" ? (
+            <p className="muted">Solving the circuit…</p>
+          ) : null}
+          {!circuit && solveStatus === "error" ? <p className="error">{error}</p> : null}
           {circuit && circuit.device_count === 0 ? (
             <p className="muted">Place a ring sensor to get S-parameters and T_drop.</p>
           ) : null}
-          {circuit ? (
+          {circuit && circuit.device_count > 0 ? (
             <>
-              <p className="bar-section">Design</p>
+              <p className="bar-section">At laser λ</p>
               <div className="metrics">
-                <Metric label="Devices" value={circuit.device_count} />
-                <Metric label="WG loss" value={`${fmt(circuit.wg_loss_db, 3)} dB`} />
-                <Metric label="κ" value={circuit.kappa != null ? fmt(circuit.kappa, 3) : "—"} />
-                {circuit.critical ? (
-                  <Metric label="κ_crit" value={fmt(circuit.critical.kappa, 4)} />
-                ) : null}
                 <Metric
-                  label="Sensitivity"
+                  label="λ0"
                   value={
-                    circuit.sensitivity_nm_per_riu != null
-                      ? `${fmt(circuit.sensitivity_nm_per_riu, 1)} nm/RIU`
-                      : "—"
+                    circuit.resonance_nm != null ? `${fmt(circuit.resonance_nm, 4)} nm` : "—"
                   }
                 />
-                {circuit.resonance_nm != null ? (
-                  <Metric label="λ0" value={`${fmt(circuit.resonance_nm, 4)} nm`} />
-                ) : null}
-                {circuit.resonance_nm != null ? (
-                  <Metric
-                    label="λ0 − λ"
-                    value={`${fmt(circuit.resonance_nm - platform.wavelength_nm, 4)} nm`}
-                  />
-                ) : null}
-                {circuit.q != null ? <Metric label="Q" value={fmt(circuit.q, 0)} /> : null}
-                {circuit.fsr_nm != null ? (
-                  <Metric label="FSR" value={`${fmt(circuit.fsr_nm)} nm`} />
-                ) : null}
-                {circuit.coupling_regime ? (
-                  <Metric label="Coupling" value={circuit.coupling_regime} />
-                ) : null}
+                <Metric label="Q" value={circuit.q != null ? fmt(circuit.q, 0) : "—"} />
+                <Metric label="T_through" value={fmt(circuit.t_through, 4)} />
+                <Metric label="T_drop" value={fmt(circuit.t_drop, 4)} />
+                <Metric
+                  label="κ"
+                  value={circuit.kappa != null ? fmt(circuit.kappa, 3) : "—"}
+                />
               </div>
+              <ResultFold title="Design" defaultOpen>
+                <div className="metrics">
+                  <Metric label="Devices" value={circuit.device_count} />
+                  <Metric label="WG loss" value={`${fmt(circuit.wg_loss_db, 3)} dB`} />
+                  {circuit.critical ? (
+                    <Metric label="κ_crit" value={fmt(circuit.critical.kappa, 4)} />
+                  ) : null}
+                  <Metric
+                    label="Sensitivity"
+                    value={
+                      circuit.sensitivity_nm_per_riu != null
+                        ? `${fmt(circuit.sensitivity_nm_per_riu, 1)} nm/RIU`
+                        : "—"
+                    }
+                  />
+                  {circuit.resonance_nm != null ? (
+                    <Metric
+                      label="λ0 − λ"
+                      value={`${fmt(circuit.resonance_nm - platform.wavelength_nm, 4)} nm`}
+                    />
+                  ) : null}
+                  {circuit.fsr_nm != null ? (
+                    <Metric label="FSR" value={`${fmt(circuit.fsr_nm)} nm`} />
+                  ) : null}
+                  {circuit.coupling_regime ? (
+                    <Metric label="Coupling" value={circuit.coupling_regime} />
+                  ) : null}
+                </div>
+              </ResultFold>
               <SParamTable s={circuit.s_parameters} />
               {circuit.extracted ? (
-                <>
-                  <p className="bar-section">Extracted parameters</p>
+                <ResultFold title="Extracted parameters">
                   <div className="metrics">
                     <Metric
                       label="λ0"
@@ -1110,41 +1138,39 @@ export default function App() {
                       label="ER"
                       value={`${fmt(circuit.extracted.extinction_db, 1)} dB`}
                     />
-                    <Metric label="T_through" value={fmt(circuit.extracted.t_through, 4)} />
-                    <Metric label="T_drop" value={fmt(circuit.extracted.t_drop, 4)} />
-                    <Metric label="κ" value={fmt(circuit.extracted.kappa, 3)} />
                   </div>
-                </>
+                </ResultFold>
               ) : null}
               {circuit.spectrum?.wavelength_nm?.length ? (
-                <LinePlot
-                  title="S-parameters"
-                  xLabel="Wavelength (nm)"
-                  yLabel="|S| (dB)"
-                  x={circuit.spectrum.wavelength_nm}
-                  series={[
-                    {
-                      name: "|S21| through",
-                      y: circuit.spectrum.through,
-                      kind: "through",
-                    },
-                    ...(circuit.spectrum.drop
-                      ? [
-                          {
-                            name: "|S31| drop",
-                            y: circuit.spectrum.drop,
-                            kind: "drop" as const,
-                          },
-                        ]
-                      : []),
-                  ]}
-                  db
-                  markX={platform.wavelength_nm}
-                />
+                <ResultFold title="Spectrum">
+                  <LinePlot
+                    title="S-parameters"
+                    xLabel="Wavelength (nm)"
+                    yLabel="|S| (dB)"
+                    x={circuit.spectrum.wavelength_nm}
+                    series={[
+                      {
+                        name: "|S21| through",
+                        y: circuit.spectrum.through,
+                        kind: "through",
+                      },
+                      ...(circuit.spectrum.drop
+                        ? [
+                            {
+                              name: "|S31| drop",
+                              y: circuit.spectrum.drop,
+                              kind: "drop" as const,
+                            },
+                          ]
+                        : []),
+                    ]}
+                    db
+                    markX={platform.wavelength_nm}
+                  />
+                </ResultFold>
               ) : null}
               {circuit.analyte_sweep?.n_clad?.length ? (
-                <>
-                  <p className="bar-section">Analyte sweep</p>
+                <ResultFold title="Analyte sweep">
                   <div className="metrics">
                     <Metric
                       label="dλ/dn"
@@ -1191,11 +1217,10 @@ export default function App() {
                     markX={circuit.analyte_sweep.n_design}
                     xDigits={3}
                   />
-                </>
+                </ResultFold>
               ) : null}
               {circuit.detectors?.length ? (
-                <>
-                  <p className="bar-section">Detectors</p>
+                <ResultFold title="Detectors" defaultOpen>
                   {circuit.detectors.map((d, i) => (
                     <div className="metrics" key={`${d.port}-${i}`}>
                       <Metric label="Port" value={d.port} />
@@ -1204,23 +1229,27 @@ export default function App() {
                       <Metric label="SNR" value={`${fmt(d.snr_db, 1)} dB`} />
                     </div>
                   ))}
-                </>
+                </ResultFold>
               ) : null}
               {circuit.mode.field ? (
-                <Heatmap
-                  title="Mode field monitor  |E|²"
-                  xLabel="x (nm)"
-                  yLabel="y (nm)"
-                  field={circuit.mode.field}
-                />
+                <ResultFold title="Mode field">
+                  <Heatmap
+                    title="Mode field monitor  |E|²"
+                    xLabel="x (nm)"
+                    yLabel="y (nm)"
+                    field={circuit.mode.field}
+                  />
+                </ResultFold>
               ) : null}
               {circuit.fdtd ? (
-                <FdtdPanel
-                  report={fdtdRun ?? circuit.fdtd}
-                  compactNeff={circuit.mode.n_eff}
-                  busy={fdtdBusy}
-                  onRun={runFdtd}
-                />
+                <ResultFold title="FDTD">
+                  <FdtdPanel
+                    report={fdtdRun ?? circuit.fdtd}
+                    compactNeff={circuit.mode.n_eff}
+                    busy={fdtdBusy}
+                    onRun={runFdtd}
+                  />
+                </ResultFold>
               ) : null}
             </>
           ) : null}
@@ -1583,6 +1612,43 @@ function Bar({
   );
 }
 
+function ResultFold({
+  title,
+  defaultOpen = false,
+  children,
+}: {
+  title: string;
+  defaultOpen?: boolean;
+  children: ReactNode;
+}) {
+  const [open, setOpen] = useState(defaultOpen);
+  return (
+    <div className="result-fold">
+      <button
+        type="button"
+        className="result-fold-toggle"
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+      >
+        <span>{title}</span>
+        <span className={`bar-chevron ${open ? "open" : ""}`} aria-hidden="true">
+          <svg viewBox="0 0 16 16" width="16" height="16">
+            <path
+              d="M6 3.5 11 8 6 12.5"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.6"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
+          </svg>
+        </span>
+      </button>
+      {open ? <div className="result-fold-body">{children}</div> : null}
+    </div>
+  );
+}
+
 function Field({
   label,
   value,
@@ -1632,7 +1698,6 @@ function FdtdPanel({
   const run = report.run;
   return (
     <>
-      <p className="bar-section">FDTD</p>
       <p className="muted">
         Design numbers use fitted compact models. This panel is the FDTD setup for that
         geometry. Run 2D FDTD for a scalar FDE n_eff and a coarse in-plane coupler split —
@@ -1710,8 +1775,7 @@ function toSvgPoint(e: PointerEvent<SVGElement>, svg: SVGSVGElement) {
 function SParamTable({ s }: { s?: SParams }) {
   if (!s) return null;
   return (
-    <>
-      <p className="bar-section">S-parameters</p>
+    <ResultFold title="S-parameters">
       <div className="metrics">
         <Metric label="|S11|" value={fmt(s.s11, 4)} />
         <Metric label="|S21|" value={fmt(s.s21, 4)} />
@@ -1719,10 +1783,8 @@ function SParamTable({ s }: { s?: SParams }) {
         <Metric label="|S41|" value={fmt(s.s41, 4)} />
         <Metric label="|S21| (dB)" value={fmt(s.s21_db, 2)} />
         <Metric label="|S31| (dB)" value={fmt(s.s31_db, 2)} />
-        <Metric label="T_through" value={fmt(s.t_through, 4)} />
-        <Metric label="T_drop" value={fmt(s.t_drop, 4)} />
       </div>
-    </>
+    </ResultFold>
   );
 }
 

@@ -14,12 +14,18 @@
   --danger: #b42318;
   --danger-soft: #fef3f2;
   --danger-line: #f0c7c3;
-  --chip: #fcfcf9;
+  --chip: color-mix(in srgb, #fcfcf9 62%, transparent);
   --drop: #1d6a93;
+  --glass: color-mix(in srgb, #ffffff 56%, transparent);
+  --glass-strong: color-mix(in srgb, #ffffff 74%, transparent);
+  --glass-soft: color-mix(in srgb, #ffffff 34%, transparent);
+  --glass-line: color-mix(in srgb, #ffffff 68%, var(--line));
+  --glass-blur: saturate(1.55) blur(22px);
+  --glass-inset: inset 0 1px 0 rgba(255, 255, 255, 0.72);
   --radius: 10px;
   --radius-sm: 7px;
   --radius-lg: 14px;
-  --shadow: 0 1px 2px rgba(23, 23, 23, 0.04), 0 8px 24px rgba(23, 23, 23, 0.04);
+  --shadow: var(--glass-inset), 0 1px 2px rgba(23, 23, 23, 0.04), 0 12px 32px rgba(23, 23, 23, 0.06);
   --shadow-chip: 0 10px 40px rgba(23, 23, 23, 0.06);
   --font: Inter, system-ui, sans-serif;
   color-scheme: light;
@@ -66,10 +72,13 @@ input,
 select,
 button {
   padding: 7px 10px;
-  border: 1px solid var(--line-strong);
+  border: 1px solid var(--glass-line);
   border-radius: var(--radius-sm);
-  background: var(--surface);
+  background: var(--glass-strong);
   color: var(--ink);
+  box-shadow: var(--glass-inset);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
 }
 
 input:hover,
@@ -89,7 +98,12 @@ button:focus-visible {
   height: 100%;
   display: flex;
   flex-direction: column;
-  background: var(--bg);
+  isolation: isolate;
+  background:
+    radial-gradient(920px 520px at 8% -12%, color-mix(in srgb, var(--accent) 16%, transparent), transparent 58%),
+    radial-gradient(740px 460px at 96% 4%, color-mix(in srgb, var(--drop) 12%, transparent), transparent 54%),
+    radial-gradient(820px 540px at 78% 108%, color-mix(in srgb, #c4b49a 26%, transparent), transparent 56%),
+    var(--bg);
 }
 
 .topbar {
@@ -98,9 +112,11 @@ button:focus-visible {
   justify-content: space-between;
   gap: 20px;
   padding: 10px 16px;
-  border-bottom: 1px solid var(--line);
-  background: color-mix(in srgb, var(--surface) 86%, transparent);
-  backdrop-filter: saturate(1.4) blur(16px);
+  border-bottom: 1px solid var(--glass-line);
+  background: var(--glass);
+  box-shadow: var(--shadow);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
   position: relative;
   z-index: 2;
 }
@@ -158,6 +174,28 @@ button:focus-visible {
   justify-content: flex-end;
 }
 
+.solve-status {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--muted);
+  padding: 5px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--glass-line);
+  background: var(--glass-soft);
+  white-space: nowrap;
+}
+
+.solve-status.ready {
+  color: var(--accent);
+}
+
+.solve-status.error {
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger-soft) 78%, transparent);
+  border-color: var(--danger-line);
+}
+
 .global-field {
   display: flex;
   align-items: center;
@@ -165,17 +203,20 @@ button:focus-visible {
   font-size: 12px;
   font-weight: 500;
   color: var(--ink-2);
-  background: var(--surface-2);
-  border: 1px solid var(--line);
+  background: var(--glass-soft);
+  border: 1px solid var(--glass-line);
   border-radius: 999px;
   padding: 3px 4px 3px 12px;
+  box-shadow: var(--glass-inset);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
 }
 
 .global-field input {
   width: 76px;
   padding: 5px 8px;
   border-radius: 999px;
-  background: var(--surface);
+  background: var(--glass-strong);
 }
 
 .toolbar-actions {
@@ -188,11 +229,11 @@ button:focus-visible {
   font-weight: 500;
   padding: 6px 11px;
   border-radius: 999px;
-  background: var(--surface);
+  background: var(--glass-strong);
 }
 
 .toolbar-actions button:hover {
-  background: var(--surface-2);
+  background: var(--glass);
 }
 
 .switch {
@@ -253,15 +294,21 @@ button:focus-visible {
   display: flex;
   gap: 2px;
   padding: 3px;
-  background: var(--surface-2);
-  border: 1px solid var(--line);
+  background: var(--glass-soft);
+  border: 1px solid var(--glass-line);
   border-radius: 999px;
+  box-shadow: var(--glass-inset);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
 }
 
 .view-toggle button {
   border: none;
   border-radius: 999px;
   background: transparent;
+  box-shadow: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
   color: var(--muted);
   font-size: 12px;
   font-weight: 500;
@@ -273,9 +320,9 @@ button:focus-visible {
 }
 
 .view-toggle button.active {
-  background: var(--surface);
+  background: var(--glass-strong);
   color: var(--ink);
-  box-shadow: 0 1px 2px rgba(23, 23, 23, 0.08);
+  box-shadow: var(--shadow);
 }
 
 .workspace {
@@ -288,8 +335,11 @@ button:focus-visible {
   display: flex;
   flex-direction: column;
   min-width: 44px;
-  background: var(--surface);
-  border-right: 1px solid var(--line);
+  background: var(--glass);
+  border-right: 1px solid var(--glass-line);
+  box-shadow: var(--shadow);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
 }
 
 .left-stack.open {
@@ -304,6 +354,10 @@ button:focus-visible {
   border-right: none;
   min-width: 0;
   width: auto;
+  background: transparent;
+  box-shadow: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
 }
 
 .left-stack .bar.grow.open {
@@ -335,14 +389,17 @@ button:focus-visible {
 .bar {
   display: flex;
   flex-direction: column;
-  background: var(--surface);
-  border-right: 1px solid var(--line);
+  background: var(--glass);
+  border-right: 1px solid var(--glass-line);
   min-width: 44px;
+  box-shadow: var(--shadow);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
 }
 
 .bar.right {
   border-right: none;
-  border-left: 1px solid var(--line);
+  border-left: 1px solid var(--glass-line);
 }
 
 .bar.open {
@@ -364,13 +421,16 @@ button:focus-visible {
   border: none;
   border-radius: 0;
   background: transparent;
+  box-shadow: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
   color: var(--ink);
   text-align: left;
   font-size: 12px;
   font-weight: 600;
   letter-spacing: 0.04em;
   text-transform: uppercase;
-  border-bottom: 1px solid var(--line);
+  border-bottom: 1px solid var(--glass-line);
   display: flex;
   justify-content: space-between;
   align-items: center;
@@ -378,7 +438,7 @@ button:focus-visible {
 }
 
 .bar-toggle:hover {
-  background: var(--surface-2);
+  background: var(--glass-soft);
 }
 
 .bar-toggle:focus-visible {
@@ -432,23 +492,61 @@ button:focus-visible {
   margin-top: 22px;
 }
 
+.result-fold {
+  margin-top: 16px;
+}
+
+.result-fold-toggle {
+  width: 100%;
+  margin: 0;
+  padding: 0 0 8px;
+  border: none;
+  border-radius: 0;
+  border-bottom: 1px solid var(--glass-line);
+  background: transparent;
+  box-shadow: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+
+.result-fold-toggle:hover {
+  background: transparent;
+  color: var(--ink-2);
+}
+
+.result-fold-body {
+  padding-top: 10px;
+}
+
+.result-fold-body > .plot-block:last-child {
+  margin-bottom: 0;
+}
+
 .board {
   flex: 1;
   min-width: 0;
   display: flex;
   align-items: center;
   justify-content: center;
-  background: var(--bg);
+  background: transparent;
   overflow: auto;
   padding: 20px;
 }
 
 .board.grid {
   background-image:
-    linear-gradient(var(--line) 1px, transparent 1px),
-    linear-gradient(90deg, var(--line) 1px, transparent 1px);
+    linear-gradient(color-mix(in srgb, var(--line) 70%, transparent) 1px, transparent 1px),
+    linear-gradient(90deg, color-mix(in srgb, var(--line) 70%, transparent) 1px, transparent 1px);
   background-size: 24px 24px;
-  background-color: var(--bg);
 }
 
 .empty-board {
@@ -457,10 +555,12 @@ button:focus-visible {
   display: grid;
   gap: 6px;
   justify-items: center;
-  background: var(--surface);
-  border: 1px solid var(--line);
+  background: var(--glass);
+  border: 1px solid var(--glass-line);
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
   max-width: 360px;
 }
 
@@ -521,7 +621,7 @@ button:focus-visible {
 
 .circuit-svg .chip {
   fill: var(--chip);
-  stroke: var(--line-strong);
+  stroke: var(--glass-line);
   stroke-width: 1;
   rx: 10;
 }
@@ -601,7 +701,7 @@ button:focus-visible {
 
 button.danger {
   margin-top: 4px;
-  background: var(--surface);
+  background: color-mix(in srgb, var(--danger-soft) 72%, transparent);
   color: var(--danger);
   border-color: var(--danger-line);
 }
@@ -624,7 +724,7 @@ form,
 .library-list button,
 .lib-item {
   text-align: left;
-  background: var(--surface);
+  background: var(--glass-strong);
   color: var(--ink);
   width: 100%;
   display: flex;
@@ -638,8 +738,8 @@ form,
   width: 28px;
   height: 28px;
   border-radius: 8px;
-  background: var(--surface-2);
-  border: 1px solid var(--line);
+  background: var(--glass-soft);
+  border: 1px solid var(--glass-line);
   display: grid;
   place-items: center;
   flex: none;
@@ -658,7 +758,7 @@ form,
 
 .library-list button:hover,
 .lib-item:hover {
-  background: var(--surface-2);
+  background: var(--glass);
   border-color: var(--line-strong);
 }
 
@@ -666,9 +766,10 @@ form,
 button.primary {
   text-align: center;
   justify-content: center;
-  background: var(--ink);
+  background: color-mix(in srgb, var(--ink) 88%, transparent);
   color: #fff;
-  border-color: var(--ink);
+  border-color: color-mix(in srgb, var(--ink) 70%, transparent);
+  box-shadow: var(--glass-inset), 0 8px 20px rgba(23, 23, 23, 0.12);
   font-weight: 600;
   letter-spacing: -0.01em;
 }
@@ -686,8 +787,8 @@ label {
   color: var(--ink-2);
 }
 
-.bar-body button:hover:not(:disabled):not(.primary):not(.danger) {
-  background: var(--surface-2);
+.bar-body button:hover:not(:disabled):not(.primary):not(.danger):not(.result-fold-toggle) {
+  background: var(--glass);
 }
 
 .bar-body > button,
@@ -698,11 +799,14 @@ label {
 .error {
   color: var(--danger);
   font-size: 13px;
-  background: var(--danger-soft);
+  background: color-mix(in srgb, var(--danger-soft) 78%, transparent);
   border: 1px solid var(--danger-line);
   border-radius: var(--radius-sm);
   padding: 8px 10px;
   margin: 0;
+  box-shadow: var(--glass-inset);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
 }
 
 .muted {
@@ -722,11 +826,14 @@ label {
 .metric {
   display: grid;
   gap: 3px;
-  background: var(--surface-2);
-  border: 1px solid var(--line);
+  background: var(--glass-soft);
+  border: 1px solid var(--glass-line);
   border-radius: var(--radius-sm);
   padding: 9px 10px;
   min-width: 0;
+  box-shadow: var(--glass-inset);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
 }
 
 .metric span {
@@ -750,18 +857,24 @@ label {
   height: 100%;
   overflow: visible;
   touch-action: none;
-  background: var(--surface);
+  background: var(--glass);
+  border: 1px solid var(--glass-line);
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
 }
 
 .plot {
   width: 100%;
   height: auto;
-  background: var(--surface-2);
-  border: 1px solid var(--line);
+  background: var(--glass-soft);
+  border: 1px solid var(--glass-line);
   border-radius: var(--radius-sm);
   overflow: hidden;
+  box-shadow: var(--glass-inset);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
 }
 
 .schematic circle,
@@ -804,8 +917,8 @@ label {
   display: block;
   width: 100%;
   height: auto;
-  background: var(--surface);
-  border: 1px solid var(--line);
+  background: var(--glass-strong);
+  border: 1px solid var(--glass-line);
   border-radius: var(--radius-sm);
   overflow: hidden;
 }
