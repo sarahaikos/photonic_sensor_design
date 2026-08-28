@@ -7,6 +7,7 @@ from detector import analyze_detector
 from fdtd.setup import describe_fdtd
 from ring import analyze_ring, kappa_for_critical, radius_for_laser, transmission_at_laser
 from sparams import pack_s, power_db
+from theory import circuit_theory
 from waveguide import analyze_waveguide
 
 
@@ -182,6 +183,22 @@ def analyze_circuit(
             **geo,
         }
 
+    theory = None
+    if ring and mode and ring_result:
+        c0_dev = couplers[0] if couplers else None
+        theory = circuit_theory(
+            wavelength_nm=wavelength_nm,
+            radius_um=float(ring["radius_um"]),
+            n_eff=mode["n_eff"],
+            n_g=mode["n_g"],
+            kappa=kappa,
+            config=ring.get("config", "all-pass"),
+            ring=ring_result,
+            critical_kappa=critical["kappa"] if critical else None,
+            coupler=coupler_results[0] if coupler_results else None,
+            coupler_length_um=float(c0_dev["length_um"]) if c0_dev else None,
+        )
+
     return {
         "mode": mode,
         "s_parameters": s,
@@ -196,6 +213,7 @@ def analyze_circuit(
         "radius_for_laser_um": radius_tune,
         "analyte_sweep": sweep,
         "critical": critical,
+        "theory": theory,
         "fdtd": describe_fdtd(
             width_nm,
             height_nm,

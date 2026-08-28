@@ -128,7 +128,7 @@ def run_topology(
         "field": _density_field(xs, ys, fabricated, polys, guides, "projected density"),
         "field_dilated": _density_field(xs, ys, dilated, [], guides, "dilated"),
         "field_eroded": _density_field(xs, ys, eroded, [], guides, "eroded"),
-        "field_ez": field_ez,
+        "field_ez": _with_guides(field_ez, guides),
     }
 
 
@@ -736,9 +736,27 @@ def _area(poly: list[tuple[float, float]]) -> float:
     return 0.5 * a
 
 
+def _plot_guides(guides):
+    """Raster (x transverse, y along) → plot (x along, y transverse)."""
+    return [
+        {
+            "x0": float(g["y0"]),
+            "y0": float(g["x0"]),
+            "width": float(g["height"]),
+            "height": float(g["width"]),
+        }
+        for g in guides
+    ]
+
+
+def _with_guides(field, guides):
+    if not field:
+        return field
+    return {**field, "guides": _plot_guides(guides)}
+
+
 def _density_field(xs, ys, rho, polys, guides, quantity):
     """Propagation along the plot x-axis so the two rails read as a coupler, not a sliver."""
-    _ = guides
     return {
         "x_um": ys.tolist(),
         "z_um": xs.tolist(),
@@ -746,6 +764,7 @@ def _density_field(xs, ys, rho, polys, guides, quantity):
         "quantity": quantity,
         "colormap": "density",
         "layout": "strip",
+        "guides": _plot_guides(guides),
         "polygons": [
             [{"x": y, "y": x} for x, y in p[:: max(1, len(p) // 200)]]
             for p in polys[:8]

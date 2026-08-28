@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState, type PointerEvent, type ReactNode } from "react";
+import { Chip3D } from "./Chip3D";
 
 type RingConfig = "all-pass" | "add-drop";
 type Polarization = "TE" | "TM";
-type BoardView = "top" | "section";
+type BoardView = "top" | "section" | "iso";
 type DeviceType = "ring" | "waveguide" | "coupler" | "detector";
 
 type Platform = {
@@ -191,6 +192,7 @@ type CircuitResult = {
   radius_for_laser_um?: number | null;
   analyte_sweep?: AnalyteSweep | null;
   critical?: CriticalCoupling | null;
+  theory?: TheoryReport | null;
   fdtd?: FdtdReport | null;
 };
 
@@ -277,6 +279,26 @@ type CriticalCoupling = {
   length_um: number;
   preferred: "gap" | "length";
   reachable: boolean;
+};
+
+type TheoryCheck = {
+  id: string;
+  name: string;
+  formula: string;
+  model: number | null;
+  theory: number | null;
+  unit: string;
+  rel_error: number | null;
+  ok: boolean | null;
+  tol: number;
+  note?: string;
+};
+
+type TheoryReport = {
+  source: string;
+  checks: TheoryCheck[];
+  summary: { ok: number; fail: number; na: number };
+  note: string;
 };
 
 type AnalyteSweep = {
@@ -859,6 +881,13 @@ export default function App() {
             >
               Cross-section
             </button>
+            <button
+              type="button"
+              className={view === "iso" ? "active" : ""}
+              onClick={() => setView("iso")}
+            >
+              3D
+            </button>
           </div>
           <label className="switch">
             <input
@@ -1133,6 +1162,16 @@ export default function App() {
               onWidthChange={(v) => setPlatformField("width_nm", v)}
               onHeightChange={(v) => setPlatformField("height_nm", v)}
             />
+          ) : view === "iso" ? (
+            <Chip3D
+              devices={devices}
+              selectedId={selectedId}
+              widthNm={platform.width_nm}
+              heightNm={platform.height_nm}
+              nClad={platform.n_clad}
+              onSelect={setSelectedId}
+              onPlaceSensor={placeSensor}
+            />
           ) : (
             <CircuitBoard
               devices={devices}
@@ -1205,6 +1244,11 @@ export default function App() {
                   ) : null}
                 </div>
               </ResultFold>
+              {circuit.theory?.checks?.length ? (
+                <ResultFold title="Theory" defaultOpen>
+                  <TheoryPanel report={circuit.theory} />
+                </ResultFold>
+              ) : null}
               <SParamTable s={circuit.s_parameters} />
               {circuit.extracted ? (
                 <ResultFold title="Extracted parameters">
@@ -1860,6 +1904,20 @@ function topologyDensityNote(
   return `Dark is silicon after Helmholtz filtering, tanh projection at η = ${fmt(etas.intermediate, 2)} (the layout you would write), and litho/etch bias. Fill is ${fmt(fillPct, 0)}%. ${grayBit} ${mfs}; ${gap}.${t} ${report.polygon_count} polygon${report.polygon_count === 1 ? "" : "s"} in the GDS.`;
 }
 
+function topologyBiasNote(
+  kind: "dilated" | "eroded",
+  report: TopologyResult,
+  etas: { dilated: number; intermediate: number; eroded: number }
+): string {
+  const eta = etas[kind];
+  const t = report.robust?.[kind]?.t_drop;
+  const tBit = t != null ? ` T_drop is ${fmt(t, 3)}.` : "";
+  if (kind === "dilated") {
+    return `η = ${fmt(eta, 2)} grows silicon (over-dose / under-etch). Same filtered density as the intended layout; only the threshold changes. This is one of the three blueprints in the worst-case loop, not a SEM litho model.${tBit}`;
+  }
+  return `η = ${fmt(eta, 2)} shrinks silicon (under-dose / over-etch). Same filtered density, higher threshold. The optimizer scores this split every step with the other two.${tBit}`;
+}
+
 function TopologyPanel({
   report,
   busy,
@@ -1890,6 +1948,10 @@ function TopologyPanel({
             <Metric
               label="η dilated / mid / eroded"
               value={`${fmt(etas.dilated, 2)} / ${fmt(etas.intermediate, 2)} / ${fmt(etas.eroded, 2)}`}
+            />
+            <Metric
+              label="κ target"
+              value={report.kappa_target != null ? fmt(report.kappa_target, 3) : "—"}
             />
             <Metric label={`T_drop (η=${fmt(etas.intermediate, 2)})`} value={fmt(report.t_drop, 3)} />
             <Metric label="Gray" value={fmt(report.grayscale, 3)} />
@@ -1996,6 +2058,36 @@ function TopologyPanel({
               field={report.field}
               note={topologyDensityNote(report, etas)}
               noteLabel="Projected density"
+            />
+          ) : null}
+          {report.field_dilated ? (
+            <Heatmap
+              title={`Dilated density  η=${fmt(etas.dilated, 2)}  (dark = Si)`}
+              xLabel="y (μm)"
+              yLabel="x (μm)"
+              field={report.field_dilated}
+              note={topologyBiasNote("dilated", report, etas)}
+              noteLabel="Dilated"
+            />
+          ) : null}
+          {report.field_eroded ? (
+            <Heatmap
+              title={`Eroded density  η=${fmt(etas.eroded, 2)}  (dark = Si)`}
+              xLabel="y (μm)"
+              yLabel="x (μm)"
+              field={report.field_eroded}
+              note={topologyBiasNote("eroded", report, etas)}
+              noteLabel="Eroded"
+            />
+          ) : null}
+          {report.field_ez ? (
+            <Heatmap
+              title="FDFD |Ez|  (intermediate strip)"
+              xLabel="y (μm)"
+              yLabel="x (μm)"
+              field={report.field_ez}
+              note="Scalar |Ez| on the η-intermediate coupler after the last TO step. Same 2.5D strip as the density maps — not a 3D ring field."
+              noteLabel="|Ez|"
             />
           ) : null}
         </>
@@ -2129,6 +2221,69 @@ function toSvgPoint(e: PointerEvent<SVGElement>, svg: SVGSVGElement) {
   pt.x = e.clientX;
   pt.y = e.clientY;
   return pt.matrixTransform(ctm.inverse());
+}
+
+function TheoryPanel({ report }: { report: TheoryReport }) {
+  const { ok, fail, na } = report.summary;
+  return (
+    <>
+      <p className="muted">{report.note}</p>
+      <p className="theory-summary">
+        <span className="theory-pill ok">{ok} match</span>
+        <span className="theory-pill fail">{fail} off</span>
+        {na > 0 ? <span className="theory-pill na">{na} n/a</span> : null}
+      </p>
+      <div className="theory-list">
+        {report.checks.map((c) => {
+          const status =
+            c.ok === true ? "ok" : c.ok === false ? "fail" : "na";
+          const errPct =
+            c.rel_error != null ? `${fmt(c.rel_error * 100, 2)}%` : "—";
+          const unit = c.unit ? ` ${c.unit}` : "";
+          const statusLabel =
+            c.id === "kappa_crit"
+              ? status === "ok"
+                ? "near critical"
+                : status === "fail"
+                  ? "far from critical"
+                  : "n/a"
+              : status === "ok"
+                ? "match"
+                : status === "fail"
+                  ? "off"
+                  : "n/a";
+          return (
+            <div key={c.id} className={`theory-row ${status}`}>
+              <div className="theory-row-head">
+                <strong>{c.name}</strong>
+                <span className={`theory-status ${status}`}>{statusLabel}</span>
+              </div>
+              <p className="theory-formula">{c.formula}</p>
+              <div className="theory-vals">
+                <span>
+                  {c.id === "kappa_crit" ? "Design κ" : c.id === "q_loaded" ? "Spectrum" : "Model"}{" "}
+                  <b>{c.model != null ? `${fmt(c.model, 4)}${unit}` : "—"}</b>
+                </span>
+                <span>
+                  {c.id === "kappa_crit"
+                    ? "κ_crit"
+                    : c.id === "q_loaded"
+                      ? "Analytic"
+                      : "Theory"}{" "}
+                  <b>{c.theory != null ? `${fmt(c.theory, 4)}${unit}` : "—"}</b>
+                </span>
+                <span>
+                  |Δ| <b>{errPct}</b>
+                  <span className="theory-tol"> (tol {(c.tol * 100).toFixed(0)}%)</span>
+                </span>
+              </div>
+              {c.note ? <p className="theory-note">{c.note}</p> : null}
+            </div>
+          );
+        })}
+      </div>
+    </>
+  );
 }
 
 function SParamTable({ s }: { s?: SParams }) {
