@@ -359,7 +359,7 @@ def _optimize(
         for name, eta in _ROBUST_ETAS:
             rho_p = _project_design(rho_f, design, rho, beta, eta)
             split, e_fwd, ok = _fdfd_split(
-                rho_p, xs, ys, dx_um, n_core, n_bg, wavelength_nm, w_um, gap_um
+                rho_p, xs, ys, dx_um, n_core, n_bg, wavelength_nm, w_um, gap_um, npml, None
             )
             if not ok or split is None:
                 continue
@@ -381,8 +381,9 @@ def _optimize(
         by_name = {c["name"]: c for c in candidates}
         mid = by_name.get("intermediate", worst)
         t_th, t_dr = mid["split"]
-        gray = _grayscale(mid["rho_p"])
-        obj = worst["err"] + 0.08 * gray
+        gray_rho = mid["rho_p"]
+        gray = _grayscale(gray_rho[design]) if design.any() else _grayscale(gray_rho)
+        obj = worst["err"] + 0.02 * (beta / max(beta_final, 1.0)) * gray
         rec = {
             "step": k + 1,
             "objective": float(obj),
@@ -394,9 +395,12 @@ def _optimize(
             if name in by_name:
                 rec[f"t_drop_{name}"] = by_name[name]["t_drop"]
         history.append(rec)
-        dL_dE = _adjoint_source(worst["e_fwd"], xs, w_um, gap_um, worst["t_drop"], target)
+        w_th, w_dr = worst["split"]
+        dL_dE = _adjoint_source(
+            worst["e_fwd"], xs, dx_um, w_um, gap_um, w_th, w_dr, target, npml
+        )
         e_adj, aok = _fdfd_solve(
-            worst["rho_p"], xs, ys, dx_um, n_core, n_bg, wavelength_nm, -dL_dE
+            worst["rho_p"], xs, ys, dx_um, n_core, n_bg, wavelength_nm, -dL_dE, npml, None
         )
         if mid["e_fwd"] is not None:
             field_ez = _ez_field(xs, ys, mid["e_fwd"])
@@ -412,25 +416,19 @@ def _optimize(
         step = 0.05 * sens / (peak + 1e-12)
         updated = np.clip(rho - step, 0.0, 1.0)
         rho = np.where(design, 0.75 * rho + 0.25 * updated, rho)
-        if e_fwd is not None:
-            field_ez = _ez_field(xs, ys, e_fwd)
     return rho, history, t_th, t_dr, field_ez
 
 
-def _robust_splits(dilated, eroded, xs, ys, dx_um, n_core, n_bg, wavelength_nm, w_um, gap_um):
+def _robust_splits(
+    variants, xs, ys, dx_um, n_core, n_bg, wavelength_nm, w_um, gap_um, target
+):
     npml = max(8, int(round(0.32 / dx_um)))
-    d, _, ok_d = _fdfd_split(
-        dilated, xs, ys, dx_um, n_core, n_bg, wavelength_nm, w_um, gap_um, npml
-    )
-    e, _, ok_e = _fdfd_split(
-        eroded, xs, ys, dx_um, n_core, n_bg, wavelength_nm, w_um, gap_um, npml
-    )
     out = {}
     worst_name = None
     worst_err = -1.0
     for name, rho_p in variants.items():
         split, _, ok = _fdfd_split(
-            rho_p, xs, ys, dx_um, n_core, n_bg, wavelength_nm, w_um, gap_um
+            rho_p, xs, ys, dx_um, n_core, n_bg, wavelength_nm, w_um, gap_um, npml
         )
         if not ok or not split:
             continue
