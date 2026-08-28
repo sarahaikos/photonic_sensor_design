@@ -1860,6 +1860,20 @@ function topologyDensityNote(
   return `Dark is silicon after Helmholtz filtering, tanh projection at η = ${fmt(etas.intermediate, 2)} (the layout you would write), and litho/etch bias. Fill is ${fmt(fillPct, 0)}%. ${grayBit} ${mfs}; ${gap}.${t} ${report.polygon_count} polygon${report.polygon_count === 1 ? "" : "s"} in the GDS.`;
 }
 
+function topologyBiasNote(
+  kind: "dilated" | "eroded",
+  report: TopologyResult,
+  etas: { dilated: number; intermediate: number; eroded: number }
+): string {
+  const eta = etas[kind];
+  const t = report.robust?.[kind]?.t_drop;
+  const tBit = t != null ? ` T_drop is ${fmt(t, 3)}.` : "";
+  if (kind === "dilated") {
+    return `η = ${fmt(eta, 2)} grows silicon (over-dose / under-etch). Same filtered density as the intended layout; only the threshold changes. This is one of the three blueprints in the worst-case loop, not a SEM litho model.${tBit}`;
+  }
+  return `η = ${fmt(eta, 2)} shrinks silicon (under-dose / over-etch). Same filtered density, higher threshold. The optimizer scores this split every step with the other two.${tBit}`;
+}
+
 function TopologyPanel({
   report,
   busy,
@@ -1890,6 +1904,10 @@ function TopologyPanel({
             <Metric
               label="η dilated / mid / eroded"
               value={`${fmt(etas.dilated, 2)} / ${fmt(etas.intermediate, 2)} / ${fmt(etas.eroded, 2)}`}
+            />
+            <Metric
+              label="κ target"
+              value={report.kappa_target != null ? fmt(report.kappa_target, 3) : "—"}
             />
             <Metric label={`T_drop (η=${fmt(etas.intermediate, 2)})`} value={fmt(report.t_drop, 3)} />
             <Metric label="Gray" value={fmt(report.grayscale, 3)} />
@@ -1996,6 +2014,36 @@ function TopologyPanel({
               field={report.field}
               note={topologyDensityNote(report, etas)}
               noteLabel="Projected density"
+            />
+          ) : null}
+          {report.field_dilated ? (
+            <Heatmap
+              title={`Dilated density  η=${fmt(etas.dilated, 2)}  (dark = Si)`}
+              xLabel="y (μm)"
+              yLabel="x (μm)"
+              field={report.field_dilated}
+              note={topologyBiasNote("dilated", report, etas)}
+              noteLabel="Dilated"
+            />
+          ) : null}
+          {report.field_eroded ? (
+            <Heatmap
+              title={`Eroded density  η=${fmt(etas.eroded, 2)}  (dark = Si)`}
+              xLabel="y (μm)"
+              yLabel="x (μm)"
+              field={report.field_eroded}
+              note={topologyBiasNote("eroded", report, etas)}
+              noteLabel="Eroded"
+            />
+          ) : null}
+          {report.field_ez ? (
+            <Heatmap
+              title="FDFD |Ez|  (intermediate strip)"
+              xLabel="y (μm)"
+              yLabel="x (μm)"
+              field={report.field_ez}
+              note="Scalar |Ez| on the η-intermediate coupler after the last TO step. Same 2.5D strip as the density maps — not a 3D ring field."
+              noteLabel="|Ez|"
             />
           ) : null}
         </>
