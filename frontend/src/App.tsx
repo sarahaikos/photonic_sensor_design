@@ -192,6 +192,7 @@ type CircuitResult = {
   radius_for_laser_um?: number | null;
   analyte_sweep?: AnalyteSweep | null;
   critical?: CriticalCoupling | null;
+  theory?: TheoryReport | null;
   fdtd?: FdtdReport | null;
 };
 
@@ -278,6 +279,26 @@ type CriticalCoupling = {
   length_um: number;
   preferred: "gap" | "length";
   reachable: boolean;
+};
+
+type TheoryCheck = {
+  id: string;
+  name: string;
+  formula: string;
+  model: number | null;
+  theory: number | null;
+  unit: string;
+  rel_error: number | null;
+  ok: boolean | null;
+  tol: number;
+  note?: string;
+};
+
+type TheoryReport = {
+  source: string;
+  checks: TheoryCheck[];
+  summary: { ok: number; fail: number; na: number };
+  note: string;
 };
 
 type AnalyteSweep = {
@@ -1223,6 +1244,11 @@ export default function App() {
                   ) : null}
                 </div>
               </ResultFold>
+              {circuit.theory?.checks?.length ? (
+                <ResultFold title="Theory" defaultOpen>
+                  <TheoryPanel report={circuit.theory} />
+                </ResultFold>
+              ) : null}
               <SParamTable s={circuit.s_parameters} />
               {circuit.extracted ? (
                 <ResultFold title="Extracted parameters">
@@ -2195,6 +2221,69 @@ function toSvgPoint(e: PointerEvent<SVGElement>, svg: SVGSVGElement) {
   pt.x = e.clientX;
   pt.y = e.clientY;
   return pt.matrixTransform(ctm.inverse());
+}
+
+function TheoryPanel({ report }: { report: TheoryReport }) {
+  const { ok, fail, na } = report.summary;
+  return (
+    <>
+      <p className="muted">{report.note}</p>
+      <p className="theory-summary">
+        <span className="theory-pill ok">{ok} match</span>
+        <span className="theory-pill fail">{fail} off</span>
+        {na > 0 ? <span className="theory-pill na">{na} n/a</span> : null}
+      </p>
+      <div className="theory-list">
+        {report.checks.map((c) => {
+          const status =
+            c.ok === true ? "ok" : c.ok === false ? "fail" : "na";
+          const errPct =
+            c.rel_error != null ? `${fmt(c.rel_error * 100, 2)}%` : "—";
+          const unit = c.unit ? ` ${c.unit}` : "";
+          const statusLabel =
+            c.id === "kappa_crit"
+              ? status === "ok"
+                ? "near critical"
+                : status === "fail"
+                  ? "far from critical"
+                  : "n/a"
+              : status === "ok"
+                ? "match"
+                : status === "fail"
+                  ? "off"
+                  : "n/a";
+          return (
+            <div key={c.id} className={`theory-row ${status}`}>
+              <div className="theory-row-head">
+                <strong>{c.name}</strong>
+                <span className={`theory-status ${status}`}>{statusLabel}</span>
+              </div>
+              <p className="theory-formula">{c.formula}</p>
+              <div className="theory-vals">
+                <span>
+                  {c.id === "kappa_crit" ? "Design κ" : c.id === "q_loaded" ? "Spectrum" : "Model"}{" "}
+                  <b>{c.model != null ? `${fmt(c.model, 4)}${unit}` : "—"}</b>
+                </span>
+                <span>
+                  {c.id === "kappa_crit"
+                    ? "κ_crit"
+                    : c.id === "q_loaded"
+                      ? "Analytic"
+                      : "Theory"}{" "}
+                  <b>{c.theory != null ? `${fmt(c.theory, 4)}${unit}` : "—"}</b>
+                </span>
+                <span>
+                  |Δ| <b>{errPct}</b>
+                  <span className="theory-tol"> (tol {(c.tol * 100).toFixed(0)}%)</span>
+                </span>
+              </div>
+              {c.note ? <p className="theory-note">{c.note}</p> : null}
+            </div>
+          );
+        })}
+      </div>
+    </>
+  );
 }
 
 function SParamTable({ s }: { s?: SParams }) {
