@@ -54,7 +54,6 @@ def circuit_theory(
     """Compare compact-model outputs to textbook resonator / coupler formulas."""
     L_um = 2 * math.pi * radius_um
     lam0 = float(ring["resonance_nm"])
-    lam_laser = float(wavelength_nm)
     fsr_model = float(ring["fsr_nm"])
     # Textbook FSR at the resonance wavelength (model FSR in ring.py uses laser λ).
     fsr_theory = ((lam0 * 1e-3) ** 2) / (n_g * L_um) * 1e3
@@ -86,7 +85,8 @@ def circuit_theory(
             fsr_model,
             fsr_theory,
             "nm",
-            "Model FSR uses laser λ; theory uses resonance λ₀. Small Δ is expected.",
+            f"Model FSR uses laser λ = {wavelength_nm:.1f} nm; theory uses resonance λ₀. "
+            "Small Δ is expected.",
             tol=0.02,
         ),
         _row(
