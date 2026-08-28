@@ -7,6 +7,7 @@ from coupler import analyze_coupler
 from detector import analyze_detector
 from fdtd.setup import run_fdtd
 from ring import analyze_ring
+from topology import run_topology
 from waveguide import analyze_waveguide
 
 app = FastAPI(title="Photonic Sensor Design")
@@ -110,3 +111,35 @@ def fdtd(payload: CircuitInput):
         payload.polarization,
         payload.devices,
     )
+
+
+class TopologyInput(CircuitInput):
+    mfs_nm: float = Field(default=150.0, gt=0)
+    min_gap_nm: float = Field(default=150.0, gt=0)
+    etch_nm: float = Field(default=0.0)
+    rounding_nm: float = Field(default=20.0, ge=0)
+    beta: float = Field(default=8.0, gt=0)
+    steps: int = Field(default=8, ge=0, le=20)
+    kappa_target: float | None = Field(default=None, ge=0, le=1)
+
+
+@app.post("/api/topology")
+def topology(payload: TopologyInput):
+    result = run_topology(
+        payload.width_nm,
+        payload.height_nm,
+        payload.wavelength_nm,
+        payload.n_clad,
+        payload.polarization,
+        payload.devices,
+        mfs_nm=payload.mfs_nm,
+        min_gap_nm=payload.min_gap_nm,
+        etch_nm=payload.etch_nm,
+        rounding_nm=payload.rounding_nm,
+        beta=payload.beta,
+        steps=payload.steps,
+        kappa_target=payload.kappa_target,
+    )
+    if result.get("error"):
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result

@@ -83,7 +83,7 @@ def run_yee(
             dft_hx_mon += Hx[:, j_mon] * phase
 
         if n == n_steps * 2 // 3:
-            snap = np.abs(Ez).T.copy()
+            snap = np.abs(Ez).copy()
 
     eth = float(np.sum(np.abs(dft_ez_mon[mask_th]) ** 2))
     edr = float(np.sum(np.abs(dft_ez_mon[mask_dr]) ** 2)) if drop_x is not None else 0.0
@@ -94,13 +94,35 @@ def run_yee(
     pth = abs(poynting_power(dft_ez_mon * mask_th, dft_hx_mon * mask_th, dx))
     field = None
     if snap is not None:
+        # snap is |Ez|(nx, ny). Plot propagation along x so the two rails read as a coupler.
         peak = float(np.nanmax(snap)) or 1.0
         if np.isfinite(peak) and peak > 0:
+            y0 = float(grid.y[0])
+            yspan = float(grid.y[-1] - grid.y[0])
+            guides = [
+                {
+                    "x0": y0,
+                    "y0": float(through_x - wg_width_um * 0.5),
+                    "width": yspan,
+                    "height": float(wg_width_um),
+                }
+            ]
+            if drop_x is not None:
+                guides.append(
+                    {
+                        "x0": y0,
+                        "y0": float(drop_x - wg_width_um * 0.5),
+                        "width": yspan,
+                        "height": float(wg_width_um),
+                    }
+                )
             field = {
-                "x_um": grid.x.tolist(),
-                "z_um": grid.y.tolist(),
+                "x_um": grid.y.tolist(),
+                "z_um": grid.x.tolist(),
                 "intensity": np.clip(snap / peak, 0, 1).tolist(),
                 "quantity": "|Ez| snapshot",
+                "layout": "strip",
+                "guides": guides,
             }
     return {
         "steps": n_steps,

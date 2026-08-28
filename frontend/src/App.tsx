@@ -60,8 +60,11 @@ type FieldMap = {
   z_um?: number[];
   intensity: number[][];
   quantity: string;
+  colormap?: "jet" | "density";
+  layout?: "strip";
   core?: { x0: number; y0: number; width: number; height: number };
   guides?: { x0: number; y0: number; width: number; height: number }[];
+  polygons?: { x: number; y: number }[][];
 };
 
 type SParams = {
@@ -210,6 +213,60 @@ type FdtdReport = {
     engine?: string;
     error?: string;
   } | null;
+};
+
+type TopologyDrc = {
+  mfs_nm: number;
+  min_gap_nm: number;
+  min_feature_nm: number;
+  min_gap_meas_nm: number;
+  mfs_ok: boolean;
+  gap_ok: boolean;
+  fill: number;
+};
+
+type TopologyResult = {
+  error?: string;
+  filter: string;
+  projection: string;
+  fabrication: string;
+  vectorizer: string;
+  dx_nm: number;
+  beta: number;
+  etas?: { dilated: number; intermediate: number; eroded: number };
+  filter_radius_nm: number;
+  steps: number;
+  kappa_target: number | null;
+  t_through: number | null;
+  t_drop: number | null;
+  kappa: number | null;
+  grayscale: number;
+  drc: TopologyDrc;
+  history: {
+    step: number;
+    objective: number;
+    t_drop: number;
+    beta: number;
+    worst?: "dilated" | "intermediate" | "eroded";
+    t_drop_dilated?: number;
+    t_drop_intermediate?: number;
+    t_drop_eroded?: number;
+  }[];
+  robust?: {
+    dilated?: { t_through: number; t_drop: number };
+    intermediate?: { t_through: number; t_drop: number };
+    eroded?: { t_through: number; t_drop: number };
+    worst?: "dilated" | "intermediate" | "eroded";
+    t_drop_worst?: number;
+  } | null;
+  polygons: { x: number; y: number }[][];
+  polygon_count: number;
+  gds_b64: string;
+  gds_bytes: number;
+  field: FieldMap;
+  field_dilated?: FieldMap;
+  field_eroded?: FieldMap;
+  field_ez?: FieldMap;
 };
 
 type CriticalCoupling = {
@@ -543,6 +600,8 @@ export default function App() {
   const [resultsOpen, setResultsOpen] = useState(true);
   const [fdtdRun, setFdtdRun] = useState<FdtdReport | null>(null);
   const [fdtdBusy, setFdtdBusy] = useState(false);
+  const [topologyRun, setTopologyRun] = useState<TopologyResult | null>(null);
+  const [topologyBusy, setTopologyBusy] = useState(false);
 
   const selected = devices.find((d) => d.id === selectedId) ?? null;
 
@@ -622,6 +681,32 @@ export default function App() {
     );
   }
 
+  async function runTopology() {
+    setTopologyBusy(true);
+    try {
+      const pin = devices.find((d): d is DetectorDevice => d.type === "detector");
+      const res = await fetch("/api/topology", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ...platform,
+          devices,
+          input_power_uw: pin?.optical_power_uw ?? 10,
+          kappa_target: circuit?.critical?.kappa ?? circuit?.kappa ?? undefined,
+        }),
+      });
+      if (!res.ok) {
+        setError("Topology run failed.");
+        return;
+      }
+      setTopologyRun((await res.json()) as TopologyResult);
+    } catch {
+      setError("Could not reach the Python backend. Start it on port 8000.");
+    } finally {
+      setTopologyBusy(false);
+    }
+  }
+
   async function runFdtd() {
     setFdtdBusy(true);
     try {
@@ -694,6 +779,7 @@ export default function App() {
         setError("");
         setSolveStatus("ready");
         setFdtdRun(null);
+        setTopologyRun(null);
       } catch (err) {
         if (err instanceof DOMException && err.name === "AbortError") return;
         setError("Could not reach the Python backend. Start it on port 8000.");
@@ -1251,6 +1337,13 @@ export default function App() {
                   />
                 </ResultFold>
               ) : null}
+              <ResultFold title="Topology">
+                <TopologyPanel
+                  report={topologyRun}
+                  busy={topologyBusy}
+                  onRun={runTopology}
+                />
+              </ResultFold>
             </>
           ) : null}
         </Bar>
@@ -1679,6 +1772,238 @@ function Field({
   );
 }
 
+function topologyObjectiveNote(report: TopologyResult): string {
+  const h = report.history;
+  const first = h[0];
+  const last = h[h.length - 1];
+  const target = report.kappa_target;
+  const start = first.objective;
+  const end = last.objective;
+  const ratio = end / (Math.abs(start) > 1e-12 ? start : 1e-12);
+  let trend: string;
+  if (end < 1e-4) {
+    trend = `ended near zero (${fmt(end, 4)}), so the worst blueprint is on the κ target`;
+  } else if (ratio < 0.7) {
+    trend = `fell from ${fmt(start, 3)} to ${fmt(end, 3)}, so the worst blueprint moved closer to the target`;
+  } else if (ratio > 1.2) {
+    trend = `rose from ${fmt(start, 3)} to ${fmt(end, 3)}; the worst-case split did not improve`;
+  } else {
+    trend = `stayed near ${fmt(end, 3)}; the worst-case error barely moved`;
+  }
+  const counts = { dilated: 0, intermediate: 0, eroded: 0 };
+  for (const step of h) {
+    if (step.worst) counts[step.worst] += 1;
+  }
+  const counted = (Object.entries(counts) as [keyof typeof counts, number][]).filter(
+    ([, n]) => n > 0
+  );
+  const who =
+    counted.length > 0
+      ? ` The adjoint used ${counted.map(([name, n]) => `${name} on ${n} step${n === 1 ? "" : "s"}`).join(", ")}.`
+      : "";
+  const tgt = target != null ? ` Target κ is ${fmt(target, 2)}.` : "";
+  const lastWorst = last.worst ? ` Last update was the ${last.worst} geometry.` : "";
+  return `Each point is the largest (T_drop − κ)² among dilated / intermediate / eroded, plus a small grayscale penalty on the intended layout.${tgt} The curve ${trend}.${who}${lastWorst}`;
+}
+
+function topologyTDropNote(
+  report: TopologyResult,
+  etas: { dilated: number; intermediate: number; eroded: number }
+): string {
+  const last = report.history[report.history.length - 1];
+  const d = last.t_drop_dilated;
+  const m = last.t_drop_intermediate;
+  const e = last.t_drop_eroded;
+  if (d == null || m == null || e == null) return "";
+  const target = report.kappa_target ?? 0.5;
+  const rows: [string, number][] = [
+    ["dilated", d],
+    ["intermediate", m],
+    ["eroded", e],
+  ];
+  const farthest = rows.reduce((a, b) =>
+    Math.abs(b[1] - target) > Math.abs(a[1] - target) ? b : a
+  );
+  const spread = Math.abs(d - e);
+  const final = report.robust;
+  const finalBit =
+    final?.dilated && final?.eroded
+      ? ` On the finished layout, T_drop is ${fmt(final.dilated.t_drop, 3)} dilated and ${fmt(final.eroded.t_drop, 3)} eroded${final.worst ? ` (${final.worst} is worst)` : ""}.`
+      : "";
+  const spreadBit =
+    spread < 0.05
+      ? ` Dilated and eroded stay within ${fmt(spread, 3)}, so the split is fairly stable to over/under-etch.`
+      : ` Dilated and eroded differ by ${fmt(spread, 3)}; bias still moves the split.`;
+  return `The three traces are the same filtered density with η = ${fmt(etas.dilated, 2)} (features grow), ${fmt(etas.intermediate, 2)} (intended chip), and ${fmt(etas.eroded, 2)} (features shrink). Target κ is ${fmt(target, 2)}. Last step: dilated ${fmt(d, 3)}, intermediate ${fmt(m, 3)}, eroded ${fmt(e, 3)}. ${farthest[0]} is farthest from the target (|Δκ| = ${fmt(Math.abs(farthest[1] - target), 3)}).${spreadBit}${finalBit}`;
+}
+
+function topologyDensityNote(
+  report: TopologyResult,
+  etas: { dilated: number; intermediate: number; eroded: number }
+): string {
+  const gray = report.grayscale;
+  const fillPct = report.drc.fill * 100;
+  const grayBit =
+    gray < 0.08
+      ? `Little leftover gray (${fmt(gray, 3)}), so most pixels are binary Si or clad.`
+      : `Grayscale is still ${fmt(gray, 3)}; some pixels are neither fully Si nor clad.`;
+  const mfs = report.drc.mfs_ok
+    ? `min feature ${fmt(report.drc.min_feature_nm, 0)} nm meets the ${fmt(report.drc.mfs_nm, 0)} nm DUV rule`
+    : `min feature ${fmt(report.drc.min_feature_nm, 0)} nm is below the ${fmt(report.drc.mfs_nm, 0)} nm DUV MFS`;
+  const gap = report.drc.gap_ok
+    ? `min gap ${fmt(report.drc.min_gap_meas_nm, 0)} nm is OK`
+    : `min gap ${fmt(report.drc.min_gap_meas_nm, 0)} nm is below the ${fmt(report.drc.min_gap_nm, 0)} nm rule`;
+  const t =
+    report.t_drop != null
+      ? ` Intermediate T_drop is ${fmt(report.t_drop, 3)}.`
+      : "";
+  return `Dark is silicon after Helmholtz filtering, tanh projection at η = ${fmt(etas.intermediate, 2)} (the layout you would write), and litho/etch bias. Fill is ${fmt(fillPct, 0)}%. ${grayBit} ${mfs}; ${gap}.${t} ${report.polygon_count} polygon${report.polygon_count === 1 ? "" : "s"} in the GDS.`;
+}
+
+function TopologyPanel({
+  report,
+  busy,
+  onRun,
+}: {
+  report: TopologyResult | null;
+  busy: boolean;
+  onRun: () => void;
+}) {
+  const etas = report?.etas ?? { dilated: 0.3, intermediate: 0.5, eroded: 0.7 };
+  return (
+    <>
+      <p className="muted">
+        Density TO of the coupler: Helmholtz filter and tanh projection for DUV min
+        feature size. Each step uses the worst κ error of dilated / intermediate /
+        eroded (η = {fmt(etas.dilated, 2)} / {fmt(etas.intermediate, 2)} /{" "}
+        {fmt(etas.eroded, 2)}; Piggott / Wang), then litho/etch bias and GDS. Same 2.5D
+        strip as FDTD — not a 3D ring solve.
+      </p>
+      <button type="button" onClick={onRun} disabled={busy}>
+        {busy ? "Running topology…" : "Run topology"}
+      </button>
+      {report ? (
+        <>
+          <div className="metrics">
+            <Metric label="Δx" value={`${fmt(report.dx_nm, 0)} nm`} />
+            <Metric label="β" value={fmt(report.beta, 1)} />
+            <Metric
+              label="η dilated / mid / eroded"
+              value={`${fmt(etas.dilated, 2)} / ${fmt(etas.intermediate, 2)} / ${fmt(etas.eroded, 2)}`}
+            />
+            <Metric label={`T_drop (η=${fmt(etas.intermediate, 2)})`} value={fmt(report.t_drop, 3)} />
+            <Metric label="Gray" value={fmt(report.grayscale, 3)} />
+            <Metric
+              label="MFS"
+              value={report.drc.mfs_ok ? `${fmt(report.drc.min_feature_nm, 0)} nm` : "fail"}
+            />
+            <Metric
+              label="Gap"
+              value={report.drc.gap_ok ? `${fmt(report.drc.min_gap_meas_nm, 0)} nm` : "fail"}
+            />
+            <Metric label="Polygons" value={report.polygon_count} />
+          </div>
+          <p className="muted">
+            {report.filter}. {report.projection}. {report.vectorizer}.{" "}
+            {report.fabrication}.
+          </p>
+          {report.robust?.dilated || report.robust?.eroded || report.robust?.intermediate ? (
+            <div className="metrics">
+              {report.robust?.dilated ? (
+                <Metric
+                  label={`Dilated T_drop (η=${fmt(etas.dilated, 2)})`}
+                  value={fmt(report.robust.dilated.t_drop, 3)}
+                />
+              ) : null}
+              {report.robust?.eroded ? (
+                <Metric
+                  label={`Eroded T_drop (η=${fmt(etas.eroded, 2)})`}
+                  value={fmt(report.robust.eroded.t_drop, 3)}
+                />
+              ) : null}
+              {report.robust?.t_drop_worst != null ? (
+                <Metric
+                  label={`Worst T_drop (${report.robust.worst ?? "—"})`}
+                  value={fmt(report.robust.t_drop_worst, 3)}
+                />
+              ) : null}
+            </div>
+          ) : null}
+          {report.gds_b64 ? (
+            <button type="button" onClick={() => downloadGds(report.gds_b64)}>
+              Download GDS ({report.gds_bytes} B)
+            </button>
+          ) : null}
+          {report.history.length > 1 ? (
+            <>
+              <LinePlot
+                title="Worst-case TO objective"
+                xLabel="Step"
+                yLabel="max (T_drop − target)²"
+                x={report.history.map((h) => h.step)}
+                series={[
+                  {
+                    name: "worst κ error",
+                    y: report.history.map((h) => h.objective),
+                    kind: "through",
+                  },
+                ]}
+                yAuto
+                xDigits={0}
+                note={topologyObjectiveNote(report)}
+                noteLabel="Objective"
+              />
+              {report.history.every(
+                (h) =>
+                  h.t_drop_dilated != null &&
+                  h.t_drop_intermediate != null &&
+                  h.t_drop_eroded != null
+              ) ? (
+                <LinePlot
+                  title="T_drop dilated / intermediate / eroded"
+                  xLabel="Step"
+                  yLabel="T_drop"
+                  x={report.history.map((h) => h.step)}
+                  series={[
+                    {
+                      name: "dilated",
+                      y: report.history.map((h) => h.t_drop_dilated as number),
+                      kind: "drop",
+                    },
+                    {
+                      name: "intermediate",
+                      y: report.history.map((h) => h.t_drop_intermediate as number),
+                      kind: "through",
+                    },
+                    {
+                      name: "eroded",
+                      y: report.history.map((h) => h.t_drop_eroded as number),
+                      kind: "mid",
+                    },
+                  ]}
+                  xDigits={0}
+                  note={topologyTDropNote(report, etas)}
+                  noteLabel="T_drop"
+                />
+              ) : null}
+            </>
+          ) : null}
+          {report.field ? (
+            <Heatmap
+              title="Projected density  (dark = Si)"
+              xLabel="y (μm)"
+              yLabel="x (μm)"
+              field={report.field}
+              note={topologyDensityNote(report, etas)}
+              noteLabel="Projected density"
+            />
+          ) : null}
+        </>
+      ) : null}
+    </>
+  );
+}
+
 function FdtdPanel({
   report,
   compactNeff,
@@ -1738,8 +2063,8 @@ function FdtdPanel({
       {run?.field ? (
         <Heatmap
           title="2D FDTD |Ez| snapshot"
-          xLabel="x (μm)"
-          yLabel="z (μm)"
+          xLabel="y (μm)"
+          yLabel="x (μm)"
           field={run.field}
         />
       ) : fde?.field ? (
@@ -1761,6 +2086,40 @@ function Metric({ label, value }: { label: string; value: string | number }) {
       <strong>{value}</strong>
     </div>
   );
+}
+
+function PlotNoteCard({ label, note }: { label: string; note?: string }) {
+  if (!note) return null;
+  const bits = note
+    .split(/(?<=\.)\s+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return (
+    <div className="metric plot-note-card">
+      <span>{label}</span>
+      {bits.length > 1 ? (
+        <ul>
+          {bits.map((bit) => (
+            <li key={bit}>{bit}</li>
+          ))}
+        </ul>
+      ) : (
+        <strong>{note}</strong>
+      )}
+    </div>
+  );
+}
+
+function downloadGds(b64: string) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  const url = URL.createObjectURL(new Blob([bytes], { type: "application/octet-stream" }));
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "coupler_to.gds";
+  a.click();
+  URL.revokeObjectURL(url);
 }
 
 function toSvgPoint(e: PointerEvent<SVGElement>, svg: SVGSVGElement) {
@@ -1812,6 +2171,15 @@ function jetRgb(v: number): [number, number, number] {
   return [Math.round(255 * r), Math.round(255 * g), Math.round(255 * b)];
 }
 
+function densityRgb(v: number): [number, number, number] {
+  const t = Math.min(1, Math.max(0, v));
+  return [
+    Math.round(236 + (44 - 236) * t),
+    Math.round(236 + (44 - 236) * t),
+    Math.round(230 + (42 - 230) * t),
+  ];
+}
+
 function fieldToDataUrl(field: FieldMap) {
   const z = field.intensity;
   const ny = z.length;
@@ -1823,9 +2191,10 @@ function fieldToDataUrl(field: FieldMap) {
   const ctx = canvas.getContext("2d");
   if (!ctx) return "";
   const img = ctx.createImageData(nx, ny);
+  const rgb = field.colormap === "density" ? densityRgb : jetRgb;
   for (let iy = 0; iy < ny; iy++) {
     for (let ix = 0; ix < nx; ix++) {
-      const [r, g, b] = jetRgb(z[iy][ix]);
+      const [r, g, b] = rgb(z[iy][ix]);
       const row = ny - 1 - iy;
       const i = (row * nx + ix) * 4;
       img.data[i] = r;
@@ -1843,11 +2212,15 @@ function Heatmap({
   xLabel,
   yLabel,
   field,
+  note,
+  noteLabel = "Reading",
 }: {
   title: string;
   xLabel: string;
   yLabel: string;
   field: FieldMap;
+  note?: string;
+  noteLabel?: string;
 }) {
   const x = field.x_nm ?? field.x_um ?? [];
   const y = field.y_nm ?? field.z_um ?? [];
@@ -1862,7 +2235,8 @@ function Heatmap({
   const ymax = y[y.length - 1];
   const aspect = (xmax - xmin) / (ymax - ymin || 1);
   const maxW = 270;
-  const maxH = 170;
+  const maxH = field.colormap === "density" || field.layout === "strip" ? 120 : 170;
+  const tickD = Math.max(Math.abs(xmax - xmin), Math.abs(ymax - ymin)) >= 20 ? 0 : 2;
   const plotW = aspect > maxW / maxH ? maxW : maxH * aspect;
   const plotH = aspect > maxW / maxH ? maxW / aspect : maxH;
   const barW = 12;
@@ -1900,12 +2274,19 @@ function Heatmap({
             height={py(o.y0) - py(o.y0 + o.height)}
           />
         ))}
+        {field.polygons?.map((poly, i) => (
+          <polygon
+            key={`p${i}`}
+            className="field-core"
+            points={poly.map((p) => `${px(p.x)},${py(p.y)}`).join(" ")}
+          />
+        ))}
         {field.core ? (
           <line className="field-core" x1={pad.l} y1={py(0)} x2={pad.l + plotW} y2={py(0)} />
         ) : null}
         {Array.from({ length: 48 }, (_, i) => {
           const t = i / 47;
-          const [r, g, b] = jetRgb(t);
+          const [r, g, b] = field.colormap === "density" ? densityRgb(t) : jetRgb(t);
           return (
             <rect
               key={i}
@@ -1924,21 +2305,22 @@ function Heatmap({
           0
         </text>
         <text x={pad.l} y={svgH - 8}>
-          {xmin.toFixed(0)}
+          {xmin.toFixed(tickD)}
         </text>
         <text x={pad.l + plotW} y={svgH - 8} textAnchor="end">
-          {xmax.toFixed(0)} {xLabel}
+          {xmax.toFixed(tickD)} {xLabel}
         </text>
         <text x={8} y={pad.t + 10}>
-          {ymax.toFixed(0)}
+          {ymax.toFixed(tickD)}
         </text>
         <text x={8} y={pad.t + plotH}>
-          {ymin.toFixed(0)}
+          {ymin.toFixed(tickD)}
         </text>
         <text x={12} y={pad.t + plotH / 2} transform={`rotate(-90 12 ${pad.t + plotH / 2})`}>
           {yLabel}
         </text>
       </svg>
+      <PlotNoteCard label={noteLabel} note={note} />
     </div>
   );
 }
@@ -1953,16 +2335,20 @@ function LinePlot({
   markX,
   xDigits,
   yAuto = false,
+  note,
+  noteLabel = "Reading",
 }: {
   title: string;
   xLabel: string;
   yLabel: string;
   x: number[];
-  series: { name: string; y: number[]; kind: "through" | "drop" }[];
+  series: { name: string; y: number[]; kind: "through" | "drop" | "mid" }[];
   db?: boolean;
   markX?: number;
   xDigits?: number;
   yAuto?: boolean;
+  note?: string;
+  noteLabel?: string;
 }) {
   if (!x.length || !series[0]?.y.length) return null;
   const width = 640;
@@ -2045,6 +2431,7 @@ function LinePlot({
           </span>
         ))}
       </p>
+      <PlotNoteCard label={noteLabel} note={note} />
     </div>
   );
 }
