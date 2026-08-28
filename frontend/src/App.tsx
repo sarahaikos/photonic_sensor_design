@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState, type PointerEvent, type ReactNode } from "react";
+import { Chip3D } from "./Chip3D";
 
 type RingConfig = "all-pass" | "add-drop";
 type Polarization = "TE" | "TM";
-type BoardView = "top" | "section";
+type BoardView = "top" | "section" | "iso";
 type DeviceType = "ring" | "waveguide" | "coupler" | "detector";
 
 type Platform = {
@@ -859,6 +860,13 @@ export default function App() {
             >
               Cross-section
             </button>
+            <button
+              type="button"
+              className={view === "iso" ? "active" : ""}
+              onClick={() => setView("iso")}
+            >
+              3D
+            </button>
           </div>
           <label className="switch">
             <input
@@ -1132,6 +1140,16 @@ export default function App() {
               field={mode?.field}
               onWidthChange={(v) => setPlatformField("width_nm", v)}
               onHeightChange={(v) => setPlatformField("height_nm", v)}
+            />
+          ) : view === "iso" ? (
+            <Chip3D
+              devices={devices}
+              selectedId={selectedId}
+              widthNm={platform.width_nm}
+              heightNm={platform.height_nm}
+              nClad={platform.n_clad}
+              onSelect={setSelectedId}
+              onPlaceSensor={placeSensor}
             />
           ) : (
             <CircuitBoard
