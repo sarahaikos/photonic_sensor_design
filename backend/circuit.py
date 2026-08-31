@@ -6,7 +6,7 @@ from coupler import analyze_coupler, geometry_for_kappa
 from detector import analyze_detector
 from fdtd.setup import describe_fdtd
 from ring import analyze_ring, kappa_for_critical, radius_for_laser, transmission_at_laser
-from sparams import pack_s, power_db
+from sparams import pack_s, power_db, scale_spectrum_power
 from theory import circuit_theory
 from waveguide import analyze_waveguide
 
@@ -85,12 +85,7 @@ def analyze_circuit(
         s21 = (t_through**0.5) * (1 + 0j)
         s31 = (t_drop**0.5) * (1 + 0j) if t_drop > 0 else 0j
         s = pack_s(0j, s21, s31, 0j)
-        spectrum = ring_result["spectrum"]
-        if t_wg != 1.0:
-            spectrum = dict(spectrum)
-            spectrum["through"] = [v * t_wg for v in spectrum["through"]]
-            if spectrum.get("drop"):
-                spectrum["drop"] = [v * t_wg for v in spectrum["drop"]]
+        spectrum = scale_spectrum_power(ring_result["spectrum"], t_wg)
         extracted = ring_result["extracted"]
         extracted = {
             **extracted,
@@ -116,11 +111,17 @@ def analyze_circuit(
         t_through = c0["t_through"] * t_wg
         t_drop = c0["t_drop"] * t_wg
         s = pack_s(0j, t_through**0.5, t_drop**0.5, 0j)
+        through_l = [v * t_wg for v in c0.get("through_vs_wavelength", [])]
+        drop_l = [v * t_wg for v in c0.get("cross_vs_wavelength", [])]
         core = {
             "spectrum": {
                 "wavelength_nm": c0.get("wavelength_nm", []),
-                "through": [v * t_wg for v in c0.get("through_vs_wavelength", [])],
-                "drop": [v * t_wg for v in c0.get("cross_vs_wavelength", [])],
+                "through": through_l,
+                "drop": drop_l,
+                "t_through": through_l,
+                "t_drop": drop_l,
+                "s21_db": [power_db(v) for v in through_l],
+                "s31_db": [power_db(v) for v in drop_l],
             },
             "extracted": c0.get("extracted"),
         }

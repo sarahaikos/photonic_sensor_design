@@ -1215,6 +1215,9 @@ export default function App() {
                   value={circuit.kappa != null ? fmt(circuit.kappa, 3) : "—"}
                 />
               </div>
+              {circuit.spectrum?.wavelength_nm?.length ? (
+                <SpectrumPanel circuit={circuit} laserNm={platform.wavelength_nm} />
+              ) : null}
               <ResultFold title="Design" defaultOpen>
                 <div className="metrics">
                   <Metric label="Devices" value={circuit.device_count} />
@@ -1269,34 +1272,6 @@ export default function App() {
                       value={`${fmt(circuit.extracted.extinction_db, 1)} dB`}
                     />
                   </div>
-                </ResultFold>
-              ) : null}
-              {circuit.spectrum?.wavelength_nm?.length ? (
-                <ResultFold title="Spectrum">
-                  <LinePlot
-                    title="S-parameters"
-                    xLabel="Wavelength (nm)"
-                    yLabel="|S| (dB)"
-                    x={circuit.spectrum.wavelength_nm}
-                    series={[
-                      {
-                        name: "|S21| through",
-                        y: circuit.spectrum.through,
-                        kind: "through",
-                      },
-                      ...(circuit.spectrum.drop
-                        ? [
-                            {
-                              name: "|S31| drop",
-                              y: circuit.spectrum.drop,
-                              kind: "drop" as const,
-                            },
-                          ]
-                        : []),
-                    ]}
-                    db
-                    markX={platform.wavelength_nm}
-                  />
                 </ResultFold>
               ) : null}
               {circuit.analyte_sweep?.n_clad?.length ? (
@@ -1746,6 +1721,93 @@ function Bar({
       </button>
       {open ? <div className="bar-body">{children}</div> : null}
     </aside>
+  );
+}
+
+function SpectrumPanel({ circuit, laserNm }: { circuit: CircuitResult; laserNm: number }) {
+  const [unit, setUnit] = useState<"db" | "lin">("db");
+  const spec = circuit.spectrum;
+  if (!spec?.wavelength_nm?.length || !spec.through?.length) return null;
+  const extracted = circuit.extracted;
+  const lam0 = extracted?.resonance_nm ?? circuit.resonance_nm;
+  const fwhm = extracted?.fwhm_nm ?? circuit.fwhm_nm;
+  const er = extracted?.extinction_db ?? circuit.extinction_db;
+  const fsr = extracted?.fsr_nm ?? circuit.fsr_nm;
+  const drop = spec.t_drop ?? spec.drop;
+  const throughLin = spec.t_through ?? spec.through;
+  const useDb = unit === "db";
+  const throughY =
+    useDb && spec.s21_db?.length === spec.wavelength_nm.length ? spec.s21_db : throughLin;
+  const dropY =
+    drop && useDb && spec.s31_db?.length === spec.wavelength_nm.length ? spec.s31_db : drop;
+  const marks: PlotMark[] = [{ x: laserNm, label: "λ", kind: "laser" }];
+  if (lam0 != null) marks.push({ x: lam0, label: "λ0", kind: "res" });
+  if (lam0 != null && fwhm != null && fwhm > 0) {
+    marks.push({ x: lam0 - fwhm / 2, label: "−½", kind: "fwhm" });
+    marks.push({ x: lam0 + fwhm / 2, label: "+½", kind: "fwhm" });
+  }
+  const detune =
+    lam0 != null ? ` Laser is ${fmt(laserNm - lam0, 3)} nm from λ₀.` : "";
+  const note = `Through and drop are optical power vs wavelength from the compact-model ring (or coupler) sweep.${
+    fsr != null ? ` FSR is ${fmt(fsr, 3)} nm.` : ""
+  }${fwhm != null ? ` FWHM is ${fmt(fwhm, 4)} nm.` : ""}${
+    er != null ? ` Extinction is ${fmt(er, 1)} dB.` : ""
+  }${detune} Dashed guides mark the laser, resonance, and half-maximum points used for Q_loaded.`;
+
+  return (
+    <ResultFold title="Spectrum" defaultOpen>
+      <div className="spectrum-toolbar">
+        <div className="view-toggle" role="group" aria-label="Spectrum units">
+          <button
+            type="button"
+            className={useDb ? "active" : ""}
+            onClick={() => setUnit("db")}
+          >
+            dB
+          </button>
+          <button
+            type="button"
+            className={!useDb ? "active" : ""}
+            onClick={() => setUnit("lin")}
+          >
+            Linear
+          </button>
+        </div>
+      </div>
+      <div className="metrics">
+        <Metric label="λ0" value={lam0 != null ? `${fmt(lam0, 4)} nm` : "—"} />
+        <Metric label="FWHM" value={fwhm != null ? `${fmt(fwhm, 4)} nm` : "—"} />
+        <Metric label="ER" value={er != null ? `${fmt(er, 1)} dB` : "—"} />
+        <Metric label="FSR" value={fsr != null ? `${fmt(fsr, 3)} nm` : "—"} />
+      </div>
+      <LinePlot
+        title={useDb ? "Transmission" : "Transmission (linear)"}
+        xLabel="Wavelength (nm)"
+        yLabel={useDb ? "T (dB)" : "T"}
+        x={spec.wavelength_nm}
+        series={[
+          {
+            name: useDb ? "T_through (dB)" : "T_through",
+            y: throughY,
+            kind: "through",
+          },
+          ...(dropY
+            ? [
+                {
+                  name: useDb ? "T_drop (dB)" : "T_drop",
+                  y: dropY,
+                  kind: "drop" as const,
+                },
+              ]
+            : []),
+        ]}
+        db={useDb && throughY === throughLin}
+        yAuto={useDb && throughY !== throughLin}
+        marks={marks}
+        note={note}
+        noteLabel="Spectrum"
+      />
+    </ResultFold>
   );
 }
 
@@ -2480,6 +2542,12 @@ function Heatmap({
   );
 }
 
+type PlotMark = {
+  x: number;
+  label?: string;
+  kind?: "laser" | "res" | "fwhm";
+};
+
 function LinePlot({
   title,
   xLabel,
@@ -2488,6 +2556,7 @@ function LinePlot({
   series,
   db = false,
   markX,
+  marks,
   xDigits,
   yAuto = false,
   note,
@@ -2500,6 +2569,7 @@ function LinePlot({
   series: { name: string; y: number[]; kind: "through" | "drop" | "mid" }[];
   db?: boolean;
   markX?: number;
+  marks?: PlotMark[];
   xDigits?: number;
   yAuto?: boolean;
   note?: string;
@@ -2560,9 +2630,24 @@ function LinePlot({
         {mapped.map((s) => (
           <path key={s.name} d={path(s.y)} className={s.kind} />
         ))}
-        {markX != null && markX >= xmin && markX <= xmax ? (
-          <line className="guide" x1={px(markX)} y1={y0} x2={px(markX)} y2={y0 + innerH} />
-        ) : null}
+        {(marks ?? (markX != null ? [{ x: markX, kind: "laser" as const }] : [])).map((m, i) =>
+          m.x >= xmin && m.x <= xmax ? (
+            <g key={`${m.kind ?? "mark"}-${i}`}>
+              <line
+                className={`guide ${m.kind ?? "laser"}`}
+                x1={px(m.x)}
+                y1={y0}
+                x2={px(m.x)}
+                y2={y0 + innerH}
+              />
+              {m.label ? (
+                <text className="mark-label" x={px(m.x) + 3} y={y0 + 10}>
+                  {m.label}
+                </text>
+              ) : null}
+            </g>
+          ) : null
+        )}
         <text x={x0} y={height - 6}>
           {xmin.toFixed(xd)}
         </text>
