@@ -617,6 +617,7 @@ export default function App() {
   const [solveStatus, setSolveStatus] = useState<"solving" | "ready" | "error">("solving");
   const [grid, setGrid] = useState(true);
   const [view, setView] = useState<BoardView>("top");
+  const [isoMounted, setIsoMounted] = useState(false);
   const [libraryOpen, setLibraryOpen] = useState(true);
   const [propertiesOpen, setPropertiesOpen] = useState(true);
   const [resultsOpen, setResultsOpen] = useState(true);
@@ -626,6 +627,10 @@ export default function App() {
   const [topologyBusy, setTopologyBusy] = useState(false);
 
   const selected = devices.find((d) => d.id === selectedId) ?? null;
+
+  useEffect(() => {
+    if (view === "iso") setIsoMounted(true);
+  }, [view]);
 
   function setPlatformField<K extends keyof Platform>(name: K, value: Platform[K]) {
     setPlatform((prev) => ({ ...prev, [name]: value }));
@@ -1162,17 +1167,8 @@ export default function App() {
               onWidthChange={(v) => setPlatformField("width_nm", v)}
               onHeightChange={(v) => setPlatformField("height_nm", v)}
             />
-          ) : view === "iso" ? (
-            <Chip3D
-              devices={devices}
-              selectedId={selectedId}
-              widthNm={platform.width_nm}
-              heightNm={platform.height_nm}
-              nClad={platform.n_clad}
-              onSelect={setSelectedId}
-              onPlaceSensor={placeSensor}
-            />
-          ) : (
+          ) : null}
+          {view === "top" ? (
             <CircuitBoard
               devices={devices}
               selectedId={selectedId}
@@ -1181,7 +1177,24 @@ export default function App() {
               onPatch={patchDevice}
               onPlaceSensor={placeSensor}
             />
-          )}
+          ) : null}
+          {isoMounted ? (
+            <div
+              className={view === "iso" ? "board-pane" : "board-pane is-dormant"}
+              aria-hidden={view !== "iso"}
+            >
+              <Chip3D
+                devices={devices}
+                selectedId={selectedId}
+                widthNm={platform.width_nm}
+                heightNm={platform.height_nm}
+                nClad={platform.n_clad}
+                active={view === "iso"}
+                onSelect={setSelectedId}
+                onPlaceSensor={placeSensor}
+              />
+            </div>
+          ) : null}
         </main>
 
         <Bar
