@@ -15,6 +15,25 @@ def power_db(value: float) -> float:
     return 10.0 * math.log10(max(abs(value), 1e-18))
 
 
+def scale_spectrum_power(spectrum: dict | None, t_wg: float) -> dict | None:
+    """Apply a constant power scale (bus waveguide loss) to a wavelength sweep."""
+    if spectrum is None:
+        return None
+    if t_wg == 1.0:
+        return spectrum
+    out = dict(spectrum)
+    for key in ("through", "drop", "t_through", "t_drop"):
+        vals = out.get(key)
+        if vals:
+            out[key] = [float(v) * t_wg for v in vals]
+    add_db = power_db(t_wg)
+    for key in ("s21_db", "s31_db"):
+        vals = out.get(key)
+        if vals:
+            out[key] = [float(v) + add_db for v in vals]
+    return out
+
+
 def pack_s(s11: complex, s21: complex, s31: complex = 0j, s41: complex = 0j) -> dict:
     t_through = float(abs(s21) ** 2)
     t_drop = float(abs(s31) ** 2)
