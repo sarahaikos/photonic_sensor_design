@@ -11,11 +11,13 @@ from sparams import pack_s, power_db, scale_spectrum_power
 from theory import circuit_theory
 from thermo import (
     CORNERS_K,
+    heater_scales,
     dn_eff_dt,
     kappa0_at,
     kappa_from_kappa0,
     n_eff_at,
     resonance_shift_nm,
+    solve_circuit_heat,
 )
 from waveguide import analyze_waveguide
 
@@ -213,6 +215,27 @@ def analyze_circuit(
             coupler_length_um=float(c0_dev["length_um"]) if c0_dev else None,
         )
 
+    has_heater = any(d.get("type") == "heater" for d in devices)
+    should_compute_thermal = bool(mode and (ring_result or has_heater))
+
+    thermal_corners = (
+        _thermal_corners(
+            width_nm,
+            height_nm,
+            wavelength_nm,
+            n_clad,
+            polarization,
+            ring,
+            couplers,
+            devices,
+            mode,
+            ring_result,
+            kappa,
+        )
+        if should_compute_thermal
+        else None
+    )
+
     return {
         "mode": mode,
         "s_parameters": s,
@@ -226,20 +249,7 @@ def analyze_circuit(
         "detectors": detector_out,
         "radius_for_laser_um": radius_tune,
         "analyte_sweep": sweep,
-        "thermal_corners": _thermal_corners(
-            width_nm,
-            height_nm,
-            wavelength_nm,
-            n_clad,
-            polarization,
-            ring,
-            couplers,
-            mode,
-            ring_result,
-            kappa,
-        )
-        if ring and mode and ring_result
-        else None,
+        "thermal_corners": thermal_corners,
         "critical": critical,
         "theory": theory,
         "fdtd": describe_fdtd(
@@ -342,44 +352,162 @@ def _thermal_corners(
     wavelength_nm: float,
     n_clad: float,
     polarization: str,
-    ring: dict,
+    ring: dict | None,
     couplers: list[dict],
+    devices: list[dict],
     mode: dict,
-    ring_result: dict,
+    ring_result: dict | None,
     kappa0_design: float,
 ) -> dict:
     dndt = float(mode["dn_eff_dt"])
     n_g = float(mode["n_g"])
-    lam0 = float(ring_result["resonance_nm"])
-    config = ring.get("config", "all-pass")
-    radius = float(ring["radius_um"])
+    lam0 = float(ring_result["resonance_nm"]) if ring_result else wavelength_nm
+    config = (ring or {}).get("config", "all-pass")
+    radius = float((ring or {}).get("radius_um", 10.0))
     c0 = couplers[0] if couplers else {"gap_nm": 200.0, "length_um": 12.0}
     gap_nm = float(c0.get("gap_nm", 200))
     length_um = float(c0.get("length_um", 12))
     k0 = coupler_kappa0(gap_nm, width_nm, height_nm, wavelength_nm, polarization)
 
     points = []
-    for dt in CORNERS_K:
-        n_eff_t = n_eff_at(mode["n_eff"], dndt, dt)
+    if ring and ring_result:
+        for dt in CORNERS_K:
+            n_eff_t = n_eff_at(mode["n_eff"], dndt, dt)
+            kappa_t = (
+                kappa_from_kappa0(kappa0_at(k0, dndt, n_clad, dt), length_um)
+                if couplers
+                else kappa0_design
+            )
+            shift = resonance_shift_nm(lam0, n_g, dndt, dt)
+            tt, td = transmission_at_laser(
+                radius,
+                wavelength_nm,
+                n_eff_t,
+                kappa_t,
+                mode["loss_db_per_cm"],
+                config,
+                width_nm,
+                polarization,
+            )
+            points.append(
+                {
+                    "delta_t_k": dt,
+                    "n_eff": n_eff_t,
+                    "kappa": kappa_t,
+                    "resonance_nm": lam0 + shift,
+                    "shift_nm": shift,
+                    "t_through": tt,
+                    "t_drop": td if config == "add-drop" else None,
+                    "abs_dkappa": abs(kappa_t - kappa0_design),
+                    "abs_dlambda_nm": abs(shift),
+                }
+            )
+
+    worst_k = max(points, key=lambda p: p["abs_dkappa"]) if points else None
+    worst_l = max(points, key=lambda p: p["abs_dlambda_nm"]) if points else None
+    dldt = resonance_shift_nm(lam0, n_g, dndt, 1.0) if ring_result else 0.0
+    heat = solve_circuit_heat(devices, width_nm)
+    heater = _heater_corners(
+        heat,
+        mode,
+        n_clad,
+        wavelength_nm,
+        width_nm,
+        polarization,
+        ring,
+        ring_result,
+        couplers,
+        k0,
+        length_um,
+        kappa0_design,
+        dndt,
+    )
+    return {
+        "source": "compact dn/dT · uniform ΔT + heater PDE",
+        "dn_eff_dt": dndt,
+        "dlambda_dt_nm_per_k": dldt,
+        "t_ref_c": 20.0,
+        "corners_k": list(CORNERS_K) if points else [],
+        "points": points,
+        "worst_kappa": (
+            {
+                "delta_t_k": worst_k["delta_t_k"],
+                "kappa": worst_k["kappa"],
+                "abs_dkappa": worst_k["abs_dkappa"],
+            }
+            if worst_k
+            else None
+        ),
+        "worst_lambda": (
+            {
+                "delta_t_k": worst_l["delta_t_k"],
+                "shift_nm": worst_l["shift_nm"],
+                "abs_dlambda_nm": worst_l["abs_dlambda_nm"],
+            }
+            if worst_l
+            else None
+        ),
+        "heater": heater,
+        "note": (
+            "Ambient corners are uniform chip ΔT on FDTD-fitted n_eff and κ₀. "
+            "A placed heater solves a 2D BOX-sink heat PDE; ring and coupler "
+            "can see different ΔT. Topology can score κ cold vs hot."
+        ),
+    }
+
+
+def _heater_corners(
+    heat: dict | None,
+    mode: dict,
+    n_clad: float,
+    wavelength_nm: float,
+    width_nm: float,
+    polarization: str,
+    ring: dict | None,
+    ring_result: dict | None,
+    couplers: list[dict],
+    k0: float,
+    length_um: float,
+    kappa0_design: float,
+    dndt: float,
+) -> dict | None:
+    if not heat:
+        return None
+    n_g = float(mode["n_g"])
+    lam0 = float(ring_result["resonance_nm"]) if ring_result else wavelength_nm
+    config = (ring or {}).get("config", "all-pass")
+    radius = float((ring or {}).get("radius_um", 10.0))
+    dt_ring0 = float(heat["dt_ring_k"])
+    dt_cpl0 = float(heat["dt_coupler_k"])
+    points = []
+    for scale in heater_scales:
+        dt_r = scale * dt_ring0
+        dt_c = scale * dt_cpl0
+        n_eff_t = n_eff_at(mode["n_eff"], dndt, dt_r)
         kappa_t = (
-            kappa_from_kappa0(kappa0_at(k0, dndt, n_clad, dt), length_um)
+            kappa_from_kappa0(kappa0_at(k0, dndt, n_clad, dt_c), length_um)
             if couplers
             else kappa0_design
         )
-        shift = resonance_shift_nm(lam0, n_g, dndt, dt)
-        tt, td = transmission_at_laser(
-            radius,
-            wavelength_nm,
-            n_eff_t,
-            kappa_t,
-            mode["loss_db_per_cm"],
-            config,
-            width_nm,
-            polarization,
-        )
+        shift = resonance_shift_nm(lam0, n_g, dndt, dt_r) if ring_result else 0.0
+        tt = td = None
+        if ring and ring_result:
+            tt, td = transmission_at_laser(
+                radius,
+                wavelength_nm,
+                n_eff_t,
+                kappa_t,
+                mode["loss_db_per_cm"],
+                config,
+                width_nm,
+                polarization,
+            )
         points.append(
             {
-                "delta_t_k": dt,
+                "scale": scale,
+                "power_mw": scale * float(heat["power_mw"]),
+                "dt_ring_k": dt_r,
+                "dt_coupler_k": dt_c,
                 "n_eff": n_eff_t,
                 "kappa": kappa_t,
                 "resonance_nm": lam0 + shift,
@@ -390,33 +518,21 @@ def _thermal_corners(
                 "abs_dlambda_nm": abs(shift),
             }
         )
-
     worst_k = max(points, key=lambda p: p["abs_dkappa"])
     worst_l = max(points, key=lambda p: p["abs_dlambda_nm"])
-    dldt = resonance_shift_nm(lam0, n_g, dndt, 1.0)
     return {
-        "source": "compact dn/dT · uniform ΔT",
-        "dn_eff_dt": dndt,
-        "dlambda_dt_nm_per_k": dldt,
-        "t_ref_c": 20.0,
-        "corners_k": list(CORNERS_K),
+        **{k: heat[k] for k in ("source", "layout", "power_mw", "dt_max_k", "dt_ring_k", "dt_coupler_k", "field", "note")},
         "points": points,
         "worst_kappa": {
-            "delta_t_k": worst_k["delta_t_k"],
+            "power_mw": worst_k["power_mw"],
             "kappa": worst_k["kappa"],
             "abs_dkappa": worst_k["abs_dkappa"],
         },
         "worst_lambda": {
-            "delta_t_k": worst_l["delta_t_k"],
+            "power_mw": worst_l["power_mw"],
             "shift_nm": worst_l["shift_nm"],
             "abs_dlambda_nm": worst_l["abs_dlambda_nm"],
         },
-        "note": (
-            "Uniform chip ΔT on FDTD-fitted n_eff and κ₀. "
-            "Si dn/dT is much larger than the cladding, so +ΔT redshifts λ₀ "
-            "and usually weakens the coupler. "
-            "Not a heater PDE or thermo-optic inverse-design loop."
-        ),
     }
 
 

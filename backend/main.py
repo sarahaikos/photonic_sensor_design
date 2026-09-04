@@ -121,6 +121,7 @@ class TopologyInput(CircuitInput):
     beta: float = Field(default=8.0, gt=0)
     steps: int = Field(default=8, ge=0, le=20)
     kappa_target: float | None = Field(default=None, ge=0, le=1)
+    thermo_optic: bool = False
 
 
 @app.post("/api/topology")
@@ -139,6 +140,7 @@ def topology(payload: TopologyInput):
         beta=payload.beta,
         steps=payload.steps,
         kappa_target=payload.kappa_target,
+        thermo_optic=payload.thermo_optic,
     )
     if result.get("error"):
         raise HTTPException(status_code=400, detail=result["error"])

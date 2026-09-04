@@ -10,6 +10,18 @@ from datetime import datetime, timezone
 import numpy as np
 
 from fdtd.geometry import Rect, Scene
+from thermo import (
+    default_coupler_heater,
+    dn_clad_dt,
+    dn_eff_dt,
+    heat_field,
+    heater_hits_grid,
+    heater_layout,
+    heater_polygons,
+    paint_heaters,
+    sheet_k,
+    solve_heat,
+)
 from waveguide import analyze_waveguide
 
 # Dilated / intermediate / eroded thresholds. Wang, Lazarov & Sigmund 2011.
@@ -30,6 +42,7 @@ def run_topology(
     beta: float = 8.0,
     steps: int = 8,
     kappa_target: float | None = None,
+    thermo_optic: bool = False,
 ) -> dict:
     scene, w_um, length_um, gap_um = _coupler_scene(width_nm, devices)
     if scene is None:
@@ -37,8 +50,9 @@ def run_topology(
 
     # 2D Helmholtz is reliable on a short window; TO/GDS use that slice of the coupler.
     length_um = min(length_um, 3.6)
+    pad_um = 1.0 if thermo_optic else 0.4
     dx_um = _dx_for(w_um, length_um, gap_um)
-    xs, ys, rho0, design, guides = _raster(dx_um, w_um, length_um, gap_um)
+    xs, ys, rho0, design, guides = _raster(dx_um, w_um, length_um, gap_um, pad_um)
     r_px = float(np.clip(0.5 * mfs_nm / (dx_um * 1e3), 0.8, 2.4))
     beta = float(max(1.0, min(beta, 32.0)))
     steps = int(max(0, min(steps, 20)))
@@ -48,6 +62,17 @@ def run_topology(
     )
     n_core = float(mode["n_eff"]) if mode else 2.45
     n_bg = float(n_clad)
+    dndt_core = (
+        dn_eff_dt(mode["gamma_core"], mode["gamma_clad"], n_clad) if mode else 1.5e-4
+    )
+    dndt_clad = dn_clad_dt(n_clad)
+    heaters = []
+    if thermo_optic:
+        laid = [h for h in heater_layout(devices, width_nm) if heater_hits_grid(h, xs, ys)]
+        power = laid[0]["power_mw"] if laid else (
+            next((float(d.get("power_mw", 10.0)) for d in devices if d.get("type") == "heater"), 10.0)
+        )
+        heaters = laid or [default_coupler_heater(w_um, length_um, pad_um, power)]
 
     rho = rho0.copy()
     if design.any() and gap_um is not None:
@@ -74,6 +99,9 @@ def run_topology(
             w_um,
             gap_um,
             target,
+            heaters=heaters,
+            dndt_core=dndt_core,
+            dndt_clad=dndt_clad,
         )
 
     rho_f = helmholtz_filter(rho, r_px)
@@ -103,10 +131,36 @@ def run_topology(
             t_th = robust["intermediate"]["t_through"]
             t_dr = robust["intermediate"]["t_drop"]
 
+    thermal = None
+    field_t = None
+    if thermo_optic and gap_um is not None:
+        thermal = _thermal_report(
+            nominal,
+            xs,
+            ys,
+            dx_um,
+            n_core,
+            n_bg,
+            wavelength_nm,
+            w_um,
+            gap_um,
+            target,
+            heaters,
+            dndt_core,
+            dndt_clad,
+            guides,
+        )
+        if thermal:
+            field_t = thermal.pop("field", None)
+
     return {
         "filter": "Helmholtz PDE (Lazarov 2011)",
         "projection": "tanh / Heaviside, robust dilated–eroded (Wang 2011)",
-        "fabrication": "worst-case dilated/eroded κ in the loop (Piggott 2015; Wang 2011); morphological litho-etch after (not SEM-trained)",
+        "fabrication": (
+            "worst-case dilated/eroded κ in the loop (Piggott 2015; Wang 2011)"
+            + ("; heater-off/on permittivity (Hammond thermo-optic)" if thermo_optic else "")
+            + "; morphological litho-etch after (not SEM-trained)"
+        ),
         "vectorizer": "marching squares + Ramer–Douglas–Peucker",
         "dx_nm": dx_um * 1e3,
         "beta": beta,
@@ -134,6 +188,9 @@ def run_topology(
         )
         if gap_um is not None
         else None,
+        "thermo_optic": bool(thermo_optic),
+        "thermal": thermal,
+        "field_t": field_t,
     }
 
 
@@ -358,8 +415,7 @@ def _dx_for(w_um: float, length_um: float, gap_um: float | None) -> float:
     return dx
 
 
-def _raster(dx_um: float, w_um: float, length_um: float, gap_um: float | None):
-    pad = 0.4
+def _raster(dx_um: float, w_um: float, length_um: float, gap_um: float | None, pad: float = 0.4):
     x1 = (gap_um + w_um if gap_um is not None else 0.0) + pad
     xs = np.arange(-w_um - pad, x1 + dx_um * 0.5, dx_um)
     ys = np.arange(-pad, length_um + pad + dx_um * 0.5, dx_um)
@@ -540,41 +596,70 @@ def _optimize(
     gap_um,
     target,
     robust: bool = True,
+    heaters: list | None = None,
+    dndt_core: float = 0.0,
+    dndt_clad: float = 0.0,
 ):
-    """Piggott / Wang robust step: worst κ error of dilated, intermediate, eroded."""
+    """Piggott / Wang robust step: worst κ error of dilated, intermediate, eroded.
+
+    With heaters, each blueprint is also scored heater-off and heater-on (Hammond).
+    """
     history = []
     field_ez = None
     t_th = t_dr = None
     npml = max(8, int(round(0.32 / dx_um)))
     etas = _ROBUST_ETAS if robust else (("intermediate", 0.5),)
+    heaters = heaters or []
     for k in range(steps):
         beta = min(beta_final, 2.0 * (1.22**k))
         rho_f = helmholtz_filter(rho, r_px)
+        t_hot = None
+        if heaters:
+            t_hot = solve_heat(xs, ys, paint_heaters(xs, ys, heaters), sheet_k(rho_f))
+        temps = [("off", None)]
+        if t_hot is not None:
+            temps.append(("hot", t_hot))
         candidates = []
         for name, eta in etas:
             rho_p = _project_design(rho_f, design, rho, beta, eta)
-            split, e_fwd, ok = _fdfd_split(
-                rho_p, xs, ys, dx_um, n_core, n_bg, wavelength_nm, w_um, gap_um, npml, None
-            )
-            if not ok or split is None:
-                continue
-            t_drop = float(split[1])
-            candidates.append(
-                {
-                    "name": name,
-                    "eta": eta,
-                    "rho_p": rho_p,
-                    "split": split,
-                    "e_fwd": e_fwd,
-                    "t_drop": t_drop,
-                    "err": (t_drop - target) ** 2,
-                }
-            )
+            for tname, temp in temps:
+                split, e_fwd, ok = _fdfd_split(
+                    rho_p,
+                    xs,
+                    ys,
+                    dx_um,
+                    n_core,
+                    n_bg,
+                    wavelength_nm,
+                    w_um,
+                    gap_um,
+                    npml,
+                    None,
+                    temp,
+                    dndt_core,
+                    dndt_clad,
+                )
+                if not ok or split is None:
+                    continue
+                t_drop = float(split[1])
+                candidates.append(
+                    {
+                        "name": name,
+                        "eta": eta,
+                        "thermal": tname,
+                        "temp": temp,
+                        "rho_p": rho_p,
+                        "split": split,
+                        "e_fwd": e_fwd,
+                        "t_drop": t_drop,
+                        "err": (t_drop - target) ** 2,
+                    }
+                )
         if not candidates:
             break
         worst = max(candidates, key=lambda c: c["err"])
-        by_name = {c["name"]: c for c in candidates}
-        mid = by_name.get("intermediate", worst)
+        by_key = {(c["name"], c["thermal"]): c for c in candidates}
+        mid = by_key.get(("intermediate", "off")) or by_key.get(("intermediate", "hot"), worst)
         t_th, t_dr = mid["split"]
         gray_rho = mid["rho_p"]
         gray = _grayscale(gray_rho[design]) if design.any() else _grayscale(gray_rho)
@@ -584,18 +669,38 @@ def _optimize(
             "objective": float(obj),
             "t_drop": float(worst["t_drop"]),
             "worst": worst["name"],
+            "thermal": worst["thermal"],
             "beta": float(beta),
         }
         for name, _eta in _ROBUST_ETAS:
-            if name in by_name:
-                rec[f"t_drop_{name}"] = by_name[name]["t_drop"]
+            off = by_key.get((name, "off"))
+            hot = by_key.get((name, "hot"))
+            if off:
+                rec[f"t_drop_{name}"] = off["t_drop"]
+            if hot:
+                rec[f"t_drop_{name}_hot"] = hot["t_drop"]
+        if by_key.get(("intermediate", "off")) and by_key.get(("intermediate", "hot")):
+            rec["t_drop_off"] = by_key[("intermediate", "off")]["t_drop"]
+            rec["t_drop_hot"] = by_key[("intermediate", "hot")]["t_drop"]
         history.append(rec)
         w_th, w_dr = worst["split"]
         dL_dE = _adjoint_source(
             worst["e_fwd"], xs, dx_um, w_um, gap_um, w_th, w_dr, target, npml
         )
         e_adj, aok = _fdfd_solve(
-            worst["rho_p"], xs, ys, dx_um, n_core, n_bg, wavelength_nm, -dL_dE, npml, None
+            worst["rho_p"],
+            xs,
+            ys,
+            dx_um,
+            n_core,
+            n_bg,
+            wavelength_nm,
+            -dL_dE,
+            npml,
+            None,
+            worst.get("temp"),
+            dndt_core,
+            dndt_clad,
         )
         if mid["e_fwd"] is not None:
             field_ez = _ez_field(xs, ys, mid["e_fwd"])
@@ -612,6 +717,74 @@ def _optimize(
         updated = np.clip(rho - step, 0.0, 1.0)
         rho = np.where(design, 0.75 * rho + 0.25 * updated, rho)
     return rho, history, t_th, t_dr, field_ez
+
+
+def _thermal_report(
+    rho,
+    xs,
+    ys,
+    dx_um,
+    n_core,
+    n_bg,
+    wavelength_nm,
+    w_um,
+    gap_um,
+    target,
+    heaters,
+    dndt_core,
+    dndt_clad,
+    guides,
+):
+    if not heaters:
+        return None
+    t_hot = solve_heat(xs, ys, paint_heaters(xs, ys, heaters), sheet_k(rho))
+    npml = max(8, int(round(0.32 / dx_um)))
+    cold, _, cok = _fdfd_split(
+        rho, xs, ys, dx_um, n_core, n_bg, wavelength_nm, w_um, gap_um, npml
+    )
+    hot, _, hok = _fdfd_split(
+        rho,
+        xs,
+        ys,
+        dx_um,
+        n_core,
+        n_bg,
+        wavelength_nm,
+        w_um,
+        gap_um,
+        npml,
+        None,
+        t_hot,
+        dndt_core,
+        dndt_clad,
+    )
+    t_off = float(cold[1]) if cok and cold else None
+    t_on = float(hot[1]) if hok and hot else None
+    heat_guides = list(guides)
+    heat_guides.extend(
+        {
+            "x0": float(h["x0"]),
+            "y0": float(h["y0"]),
+            "width": float(h["width"]),
+            "height": float(h["height"]),
+        }
+        for h in heaters
+    )
+    return {
+        "source": "2D BOX-sink heat PDE + FDFD ε(T)",
+        "layout": heaters,
+        "power_mw": float(sum(h["power_mw"] for h in heaters)),
+        "dt_max_k": float(t_hot.max()),
+        "t_drop_off": t_off,
+        "t_drop_hot": t_on,
+        "abs_dkappa": abs((t_on or 0.0) - (t_off or 0.0)) if t_off is not None and t_on is not None else None,
+        "kappa_target": float(target),
+        "note": (
+            "Each TO step scores dilated/intermediate/eroded at heater off and on. "
+            "ε(x) = [n + (dn/dT) ΔT(x)]² after the BOX-sink heat solve."
+        ),
+        "field": heat_field(xs, ys, t_hot, heat_guides, heater_polygons(heaters)),
+    }
 
 
 def _robust_splits(
@@ -638,9 +811,17 @@ def _robust_splits(
     return out or None
 
 
-def _eps_pml(rho, xs, ys, dx_um, n_core, n_bg, wavelength_nm, npml=8):
+def _eps_pml(
+    rho, xs, ys, dx_um, n_core, n_bg, wavelength_nm, npml=8, temp=None, dndt_core=0.0, dndt_clad=0.0
+):
     """Permittivity on a μm grid. Small background loss + PML keeps FDFD stable."""
-    eps = n_bg**2 + np.clip(rho, 0, 1) * (n_core**2 - n_bg**2)
+    if temp is None:
+        n_c, n_b = n_core, n_bg
+    else:
+        t = np.asarray(temp, dtype=float)
+        n_c = n_core + float(dndt_core) * t
+        n_b = n_bg + float(dndt_clad) * t
+    eps = n_b**2 + np.clip(rho, 0, 1) * (n_c**2 - n_b**2)
     lam = wavelength_nm * 1e-3
     k0 = 2 * math.pi / lam
     sigma = np.zeros_like(eps)
@@ -667,9 +848,26 @@ def _jsrc_jmon(ny: int, npml: int, dx_um: float) -> tuple[int, int]:
     return jsrc, max(jmon, jsrc + 8)
 
 
-def _fdfd_split(rho, xs, ys, dx_um, n_core, n_bg, wavelength_nm, w_um, gap_um, npml=8, x0=None):
+def _fdfd_split(
+    rho,
+    xs,
+    ys,
+    dx_um,
+    n_core,
+    n_bg,
+    wavelength_nm,
+    w_um,
+    gap_um,
+    npml=8,
+    x0=None,
+    temp=None,
+    dndt_core=0.0,
+    dndt_clad=0.0,
+):
     src = _src_profile(xs, w_um)
-    e, ok = _fdfd_solve(rho, xs, ys, dx_um, n_core, n_bg, wavelength_nm, src, npml, x0)
+    e, ok = _fdfd_solve(
+        rho, xs, ys, dx_um, n_core, n_bg, wavelength_nm, src, npml, x0, temp, dndt_core, dndt_clad
+    )
     if not ok:
         return None, e, False
     jsrc, jmon = _jsrc_jmon(ys.size, npml, dx_um)
@@ -690,8 +888,24 @@ def _src_profile(xs, w_um):
     return src
 
 
-def _fdfd_solve(rho, xs, ys, dx_um, n_core, n_bg, wavelength_nm, src_x, npml=8, x0=None):
-    eps, k0, npml = _eps_pml(rho, xs, ys, dx_um, n_core, n_bg, wavelength_nm, npml)
+def _fdfd_solve(
+    rho,
+    xs,
+    ys,
+    dx_um,
+    n_core,
+    n_bg,
+    wavelength_nm,
+    src_x,
+    npml=8,
+    x0=None,
+    temp=None,
+    dndt_core=0.0,
+    dndt_clad=0.0,
+):
+    eps, k0, npml = _eps_pml(
+        rho, xs, ys, dx_um, n_core, n_bg, wavelength_nm, npml, temp, dndt_core, dndt_clad
+    )
     dx = float(dx_um)
     jsrc, _ = _jsrc_jmon(eps.shape[1], npml, dx)
     b = np.zeros_like(eps, dtype=complex)
