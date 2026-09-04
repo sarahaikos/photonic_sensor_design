@@ -122,10 +122,33 @@ type CouplerResult = {
   field?: FieldMap;
 };
 
+type ThermalCorners = {
+  source: string;
+  dn_eff_dt: number;
+  dlambda_dt_nm_per_k: number;
+  t_ref_c: number;
+  corners_k: number[];
+  points: {
+    delta_t_k: number;
+    n_eff: number;
+    kappa: number;
+    resonance_nm: number;
+    shift_nm: number;
+    t_through: number;
+    t_drop: number | null;
+    abs_dkappa: number;
+    abs_dlambda_nm: number;
+  }[];
+  worst_kappa: { delta_t_k: number; kappa: number; abs_dkappa: number };
+  worst_lambda: { delta_t_k: number; shift_nm: number; abs_dlambda_nm: number };
+  note: string;
+};
+
 type ModeResult = {
   n_eff: number;
   n_g: number;
   dn_eff_dn: number;
+  dn_eff_dt?: number;
   loss_db_per_cm: number;
   gamma_core: number;
   gamma_clad: number;
@@ -191,6 +214,7 @@ type CircuitResult = {
   detectors?: (DetectorResult & { port: string; optical_power_uw: number })[];
   radius_for_laser_um?: number | null;
   analyte_sweep?: AnalyteSweep | null;
+  thermal_corners?: ThermalCorners | null;
   critical?: CriticalCoupling | null;
   theory?: TheoryReport | null;
   fdtd?: FdtdReport | null;
@@ -1396,6 +1420,64 @@ export default function App() {
                     ]}
                     markX={circuit.analyte_sweep.n_design}
                     xDigits={3}
+                  />
+                </ResultFold>
+              ) : null}
+              {circuit.thermal_corners?.points?.length ? (
+                <ResultFold title="Thermal corners" defaultOpen>
+                  <div className="metrics">
+                    <Metric
+                      label="dn_eff/dT"
+                      value={`${fmt(circuit.thermal_corners.dn_eff_dt * 1e4, 2)}×10⁻⁴ /K`}
+                    />
+                    <Metric
+                      label="dλ/dT"
+                      value={`${fmt(circuit.thermal_corners.dlambda_dt_nm_per_k, 3)} nm/K`}
+                    />
+                    <Metric
+                      label="Worst |Δλ|"
+                      value={`${fmt(circuit.thermal_corners.worst_lambda.abs_dlambda_nm, 3)} nm @ ${fmt(circuit.thermal_corners.worst_lambda.delta_t_k, 0)} K`}
+                    />
+                    <Metric
+                      label="Worst |Δκ|"
+                      value={`${fmt(circuit.thermal_corners.worst_kappa.abs_dkappa, 3)} @ ${fmt(circuit.thermal_corners.worst_kappa.delta_t_k, 0)} K`}
+                    />
+                  </div>
+                  <LinePlot
+                    title="Resonance vs ΔT"
+                    xLabel="ΔT (K)"
+                    yLabel="Δλ (nm)"
+                    x={circuit.thermal_corners.points.map((p) => p.delta_t_k)}
+                    series={[
+                      {
+                        name: "λ0 − λ0(20 °C)",
+                        y: circuit.thermal_corners.points.map((p) => p.shift_nm),
+                        kind: "through",
+                      },
+                    ]}
+                    markX={0}
+                    xDigits={0}
+                    yAuto
+                    note={circuit.thermal_corners.note}
+                    noteLabel="Thermal"
+                  />
+                  <LinePlot
+                    title="Coupler κ vs ΔT"
+                    xLabel="ΔT (K)"
+                    yLabel="κ"
+                    x={circuit.thermal_corners.points.map((p) => p.delta_t_k)}
+                    series={[
+                      {
+                        name: "κ(ΔT)",
+                        y: circuit.thermal_corners.points.map((p) => p.kappa),
+                        kind: "drop",
+                      },
+                    ]}
+                    markX={0}
+                    xDigits={0}
+                    yAuto
+                    note={`Worst |Δκ| is ${fmt(circuit.thermal_corners.worst_kappa.abs_dkappa, 3)} at ΔT = ${fmt(circuit.thermal_corners.worst_kappa.delta_t_k, 0)} K (κ = ${fmt(circuit.thermal_corners.worst_kappa.kappa, 3)}). Same idea as dilated/eroded: score the worst corner, not only 20 °C.`}
+                    noteLabel="κ corners"
                   />
                 </ResultFold>
               ) : null}
