@@ -269,6 +269,39 @@ type TopologyResult = {
   field_dilated?: FieldMap;
   field_eroded?: FieldMap;
   field_ez?: FieldMap;
+  eta_curve?: EtaCurve | null;
+};
+
+type EtaCurve = {
+  points: { eta: number; t_through: number; t_drop: number; abs_dkappa: number }[];
+  worst_eta: number | null;
+  worst_abs_dkappa: number | null;
+  spread: number;
+};
+
+type TopologySweepRow = {
+  mfs_nm: number;
+  filter_radius_nm: number;
+  mode: "robust" | "intermediate";
+  t_drop: number | null;
+  worst?: "dilated" | "intermediate" | "eroded" | null;
+  t_drop_worst?: number | null;
+  worst_abs_dkappa: number | null;
+  dilated?: { t_through: number; t_drop: number } | null;
+  intermediate?: { t_through: number; t_drop: number } | null;
+  eroded?: { t_through: number; t_drop: number } | null;
+};
+
+type TopologySweep = {
+  kind: string;
+  kappa_target: number;
+  steps: number;
+  mfs_nm: number[];
+  modes: string[];
+  rows: TopologySweepRow[];
+  eta_curve?: EtaCurve | null;
+  note: string;
+  error?: string;
 };
 
 type CriticalCoupling = {
@@ -617,6 +650,7 @@ export default function App() {
   const [solveStatus, setSolveStatus] = useState<"solving" | "ready" | "error">("solving");
   const [grid, setGrid] = useState(true);
   const [view, setView] = useState<BoardView>("top");
+  const [isoMounted, setIsoMounted] = useState(false);
   const [libraryOpen, setLibraryOpen] = useState(true);
   const [propertiesOpen, setPropertiesOpen] = useState(true);
   const [resultsOpen, setResultsOpen] = useState(true);
@@ -624,8 +658,14 @@ export default function App() {
   const [fdtdBusy, setFdtdBusy] = useState(false);
   const [topologyRun, setTopologyRun] = useState<TopologyResult | null>(null);
   const [topologyBusy, setTopologyBusy] = useState(false);
+  const [topologySweep, setTopologySweep] = useState<TopologySweep | null>(null);
+  const [topologySweepBusy, setTopologySweepBusy] = useState(false);
 
   const selected = devices.find((d) => d.id === selectedId) ?? null;
+
+  useEffect(() => {
+    if (view === "iso") setIsoMounted(true);
+  }, [view]);
 
   function setPlatformField<K extends keyof Platform>(name: K, value: Platform[K]) {
     setPlatform((prev) => ({ ...prev, [name]: value }));
@@ -726,6 +766,33 @@ export default function App() {
       setError("Could not reach the Python backend. Start it on port 8000.");
     } finally {
       setTopologyBusy(false);
+    }
+  }
+
+  async function runTopologySweep() {
+    setTopologySweepBusy(true);
+    try {
+      const pin = devices.find((d): d is DetectorDevice => d.type === "detector");
+      const res = await fetch("/api/topology/sweep", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ...platform,
+          devices,
+          input_power_uw: pin?.optical_power_uw ?? 10,
+          steps: 4,
+          kappa_target: circuit?.critical?.kappa ?? circuit?.kappa ?? undefined,
+        }),
+      });
+      if (!res.ok) {
+        setError("Robustness sweep failed.");
+        return;
+      }
+      setTopologySweep((await res.json()) as TopologySweep);
+    } catch {
+      setError("Could not reach the Python backend. Start it on port 8000.");
+    } finally {
+      setTopologySweepBusy(false);
     }
   }
 
@@ -1162,17 +1229,8 @@ export default function App() {
               onWidthChange={(v) => setPlatformField("width_nm", v)}
               onHeightChange={(v) => setPlatformField("height_nm", v)}
             />
-          ) : view === "iso" ? (
-            <Chip3D
-              devices={devices}
-              selectedId={selectedId}
-              widthNm={platform.width_nm}
-              heightNm={platform.height_nm}
-              nClad={platform.n_clad}
-              onSelect={setSelectedId}
-              onPlaceSensor={placeSensor}
-            />
-          ) : (
+          ) : null}
+          {view === "top" ? (
             <CircuitBoard
               devices={devices}
               selectedId={selectedId}
@@ -1181,7 +1239,24 @@ export default function App() {
               onPatch={patchDevice}
               onPlaceSensor={placeSensor}
             />
-          )}
+          ) : null}
+          {isoMounted ? (
+            <div
+              className={view === "iso" ? "board-pane" : "board-pane is-dormant"}
+              aria-hidden={view !== "iso"}
+            >
+              <Chip3D
+                devices={devices}
+                selectedId={selectedId}
+                widthNm={platform.width_nm}
+                heightNm={platform.height_nm}
+                nClad={platform.n_clad}
+                active={view === "iso"}
+                onSelect={setSelectedId}
+                onPlaceSensor={placeSensor}
+              />
+            </div>
+          ) : null}
         </main>
 
         <Bar
@@ -1361,6 +1436,9 @@ export default function App() {
                   report={topologyRun}
                   busy={topologyBusy}
                   onRun={runTopology}
+                  sweep={topologySweep}
+                  sweepBusy={topologySweepBusy}
+                  onSweep={runTopologySweep}
                 />
               </ResultFold>
             </>
@@ -1984,10 +2062,16 @@ function TopologyPanel({
   report,
   busy,
   onRun,
+  sweep,
+  sweepBusy,
+  onSweep,
 }: {
   report: TopologyResult | null;
   busy: boolean;
   onRun: () => void;
+  sweep: TopologySweep | null;
+  sweepBusy: boolean;
+  onSweep: () => void;
 }) {
   const etas = report?.etas ?? { dilated: 0.3, intermediate: 0.5, eroded: 0.7 };
   return (
@@ -1999,9 +2083,14 @@ function TopologyPanel({
         {fmt(etas.eroded, 2)}; Piggott / Wang), then litho/etch bias and GDS. Same 2.5D
         strip as FDTD — not a 3D ring solve.
       </p>
-      <button type="button" onClick={onRun} disabled={busy}>
-        {busy ? "Running topology…" : "Run topology"}
-      </button>
+      <div className="spectrum-toolbar" style={{ justifyContent: "flex-start", gap: 8 }}>
+        <button type="button" onClick={onRun} disabled={busy || sweepBusy}>
+          {busy ? "Running topology…" : "Run topology"}
+        </button>
+        <button type="button" onClick={onSweep} disabled={busy || sweepBusy}>
+          {sweepBusy ? "Sweeping robustness…" : "Sweep dilated / eroded"}
+        </button>
+      </div>
       {report ? (
         <>
           <div className="metrics">
@@ -2152,7 +2241,80 @@ function TopologyPanel({
               noteLabel="|Ez|"
             />
           ) : null}
+          {report.eta_curve?.points?.length ? (
+            <EtaCurvePlot curve={report.eta_curve} target={report.kappa_target} />
+          ) : null}
         </>
+      ) : null}
+      {sweep ? <RobustnessSweepPanel sweep={sweep} /> : null}
+    </>
+  );
+}
+
+function EtaCurvePlot({ curve, target }: { curve: EtaCurve; target: number | null }) {
+  return (
+    <LinePlot
+      title="T_drop vs projection η"
+      xLabel="η"
+      yLabel="T_drop"
+      x={curve.points.map((p) => p.eta)}
+      series={[
+        { name: "T_drop(η)", y: curve.points.map((p) => p.t_drop), kind: "drop" },
+        ...(target != null
+          ? [
+              {
+                name: "κ target",
+                y: curve.points.map(() => target),
+                kind: "mid" as const,
+              },
+            ]
+          : []),
+      ]}
+      markX={0.5}
+      xDigits={2}
+      yAuto
+      note={`Lower η grows Si (dilated / under-etch); higher η shrinks it (eroded / over-etch). Spread is ${fmt(curve.spread, 3)}. Worst |T_drop − κ| is ${fmt(curve.worst_abs_dkappa, 3)} at η = ${fmt(curve.worst_eta, 2)}. A layout that sits on target at η = 0.5 can still miss after litho bias.`}
+      noteLabel="Bias sweep"
+    />
+  );
+}
+
+function RobustnessSweepPanel({ sweep }: { sweep: TopologySweep }) {
+  const mfs = sweep.mfs_nm;
+  const robust = mfs.map((v) => sweep.rows.find((r) => r.mode === "robust" && r.mfs_nm === v));
+  const mid = mfs.map((v) => sweep.rows.find((r) => r.mode === "intermediate" && r.mfs_nm === v));
+  const yRobust = robust.map((r) => r?.worst_abs_dkappa ?? 0);
+  const yMid = mid.map((r) => r?.worst_abs_dkappa ?? 0);
+  const better = yRobust.map((a, i) => (Number.isFinite(a) && Number.isFinite(yMid[i]) ? yMid[i] - a : 0));
+  const wins = better.filter((d) => d > 0.01).length;
+  const note = `${sweep.note} Target κ is ${fmt(sweep.kappa_target, 3)}. In-loop robust TO beat intermediate-only at ${wins} of ${mfs.length} filter radii (lower worst |Δκ| is better).`;
+  return (
+    <>
+      <p className="bar-section">Robustness experiment</p>
+      <div className="metrics">
+        <Metric label="Steps / case" value={sweep.steps} />
+        <Metric label="κ target" value={fmt(sweep.kappa_target, 3)} />
+        <Metric
+          label="η-curve spread"
+          value={sweep.eta_curve ? fmt(sweep.eta_curve.spread, 3) : "—"}
+        />
+      </div>
+      <LinePlot
+        title="Worst |T_drop − κ| vs DUV MFS"
+        xLabel="MFS (nm)"
+        yLabel="max |Δκ|"
+        x={mfs}
+        series={[
+          { name: "robust (in-loop)", y: yRobust, kind: "through" },
+          { name: "intermediate only", y: yMid, kind: "drop" },
+        ]}
+        xDigits={0}
+        yAuto
+        note={note}
+        noteLabel="Sweep"
+      />
+      {sweep.eta_curve?.points?.length ? (
+        <EtaCurvePlot curve={sweep.eta_curve} target={sweep.kappa_target} />
       ) : null}
     </>
   );
