@@ -129,6 +129,79 @@ def run_topology(
         "field_dilated": _density_field(xs, ys, dilated, [], guides, "dilated"),
         "field_eroded": _density_field(xs, ys, eroded, [], guides, "eroded"),
         "field_ez": _with_guides(field_ez, guides),
+        "eta_curve": _eta_split_curve(
+            rho_f, design, rho0, beta, xs, ys, dx_um, n_core, n_bg, wavelength_nm, w_um, gap_um, target
+        )
+        if gap_um is not None
+        else None,
+    }
+
+
+_ETA_SWEEP = (0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80)
+_SWEEP_MFS_NM = (100.0, 150.0, 220.0)
+
+
+def run_robustness_sweep(
+    width_nm: float,
+    height_nm: float,
+    wavelength_nm: float,
+    n_clad: float,
+    polarization: str,
+    devices: list[dict],
+    steps: int = 4,
+    kappa_target: float | None = None,
+    beta: float = 8.0,
+) -> dict:
+    """Compare in-loop robust TO vs intermediate-only across DUV filter radii."""
+    scene, w_um, length_um, gap_um = _coupler_scene(width_nm, devices)
+    if scene is None or gap_um is None:
+        return {"error": "Place a coupler to sweep dilated/eroded robustness."}
+
+    length_um = min(length_um, 3.6)
+    mode = analyze_waveguide(
+        width_nm, height_nm, wavelength_nm, n_clad, polarization, length_um=100.0
+    )
+    n_core = float(mode["n_eff"]) if mode else 2.45
+    n_bg = float(n_clad)
+    target = float(np.clip(kappa_target if kappa_target is not None else 0.12, 0.05, 0.95))
+    steps = int(max(1, min(steps, 8)))
+    beta = float(max(1.0, min(beta, 32.0)))
+
+    rows: list[dict] = []
+    eta_curve = None
+    for mfs_nm in _SWEEP_MFS_NM:
+        for robust in (True, False):
+            row = _sweep_case(
+                width_nm,
+                w_um,
+                length_um,
+                gap_um,
+                mfs_nm,
+                beta,
+                steps,
+                n_core,
+                n_bg,
+                wavelength_nm,
+                target,
+                robust,
+            )
+            rows.append(row)
+            if robust and abs(mfs_nm - 150.0) < 1e-6:
+                eta_curve = row.get("eta_curve")
+
+    return {
+        "kind": "dilated-eroded sweep",
+        "kappa_target": target,
+        "steps": steps,
+        "mfs_nm": list(_SWEEP_MFS_NM),
+        "modes": ["robust", "intermediate"],
+        "rows": rows,
+        "eta_curve": eta_curve,
+        "note": (
+            "Each row is a short TO at one Helmholtz radius (from DUV MFS). "
+            "Robust uses worst dilated/intermediate/eroded κ in the loop; "
+            "intermediate only scores η = 0.5, then dilated/eroded are evaluated after."
+        ),
     }
 
 
@@ -331,6 +404,126 @@ def _project_design(rho_f, design, rho_fixed, beta, eta):
     return np.where(design, rho_p, rho_fixed) if design.any() else rho_p
 
 
+def _eta_split_curve(
+    rho_f,
+    design,
+    rho_fixed,
+    beta,
+    xs,
+    ys,
+    dx_um,
+    n_core,
+    n_bg,
+    wavelength_nm,
+    w_um,
+    gap_um,
+    target,
+    etas=_ETA_SWEEP,
+):
+    if gap_um is None:
+        return None
+    curve = []
+    worst = None
+    worst_err = -1.0
+    for eta in etas:
+        rho_p = _project_design(rho_f, design, rho_fixed, beta, eta)
+        split, _, ok = _fdfd_split(
+            rho_p, xs, ys, dx_um, n_core, n_bg, wavelength_nm, w_um, gap_um
+        )
+        if not ok or not split:
+            continue
+        t_drop = float(split[1])
+        err = abs(t_drop - target)
+        rec = {
+            "eta": float(eta),
+            "t_through": float(split[0]),
+            "t_drop": t_drop,
+            "abs_dkappa": float(err),
+        }
+        curve.append(rec)
+        if err >= worst_err:
+            worst_err = err
+            worst = rec
+    if not curve:
+        return None
+    return {
+        "points": curve,
+        "worst_eta": worst["eta"] if worst else None,
+        "worst_abs_dkappa": worst["abs_dkappa"] if worst else None,
+        "spread": float(max(p["t_drop"] for p in curve) - min(p["t_drop"] for p in curve)),
+    }
+
+
+def _sweep_case(
+    width_nm,
+    w_um,
+    length_um,
+    gap_um,
+    mfs_nm,
+    beta,
+    steps,
+    n_core,
+    n_bg,
+    wavelength_nm,
+    target,
+    robust: bool,
+):
+    dx_um = _dx_for(w_um, length_um, gap_um)
+    xs, ys, rho0, design, _guides = _raster(dx_um, w_um, length_um, gap_um)
+    r_px = float(np.clip(0.5 * mfs_nm / (dx_um * 1e3), 0.8, 2.4))
+    rho = rho0.copy()
+    if design.any():
+        rho = _seed_swg(rho, design, ys, dx_um)
+    rho, history, t_th, t_dr, _field = _optimize(
+        rho,
+        design,
+        xs,
+        ys,
+        dx_um,
+        r_px,
+        beta,
+        steps,
+        n_core,
+        n_bg,
+        wavelength_nm,
+        w_um,
+        gap_um,
+        target,
+        robust=robust,
+    )
+    rho_f = helmholtz_filter(rho, r_px)
+    variants = {name: _project_design(rho_f, design, rho0, beta, eta) for name, eta in _ROBUST_ETAS}
+    splits = _robust_splits(variants, xs, ys, dx_um, n_core, n_bg, wavelength_nm, w_um, gap_um, target)
+    eta_curve = _eta_split_curve(
+        rho_f, design, rho0, beta, xs, ys, dx_um, n_core, n_bg, wavelength_nm, w_um, gap_um, target
+    )
+    mid = splits.get("intermediate") if splits else None
+    worst_abs = None
+    if splits:
+        vals = []
+        for name, _eta in _ROBUST_ETAS:
+            if name in splits:
+                vals.append(abs(splits[name]["t_drop"] - target))
+        if vals:
+            worst_abs = float(max(vals))
+    return {
+        "mfs_nm": float(mfs_nm),
+        "filter_radius_nm": float(r_px * dx_um * 1e3),
+        "mode": "robust" if robust else "intermediate",
+        "t_through": t_th,
+        "t_drop": mid["t_drop"] if mid else t_dr,
+        "worst": splits.get("worst") if splits else None,
+        "t_drop_worst": splits.get("t_drop_worst") if splits else None,
+        "worst_abs_dkappa": worst_abs,
+        "dilated": splits.get("dilated") if splits else None,
+        "intermediate": mid,
+        "eroded": splits.get("eroded") if splits else None,
+        "history": history,
+        "eta_curve": eta_curve,
+        "dx_nm": dx_um * 1e3,
+    }
+
+
 def _optimize(
     rho,
     design,
@@ -346,17 +539,19 @@ def _optimize(
     w_um,
     gap_um,
     target,
+    robust: bool = True,
 ):
     """Piggott / Wang robust step: worst κ error of dilated, intermediate, eroded."""
     history = []
     field_ez = None
     t_th = t_dr = None
     npml = max(8, int(round(0.32 / dx_um)))
+    etas = _ROBUST_ETAS if robust else (("intermediate", 0.5),)
     for k in range(steps):
         beta = min(beta_final, 2.0 * (1.22**k))
         rho_f = helmholtz_filter(rho, r_px)
         candidates = []
-        for name, eta in _ROBUST_ETAS:
+        for name, eta in etas:
             rho_p = _project_design(rho_f, design, rho, beta, eta)
             split, e_fwd, ok = _fdfd_split(
                 rho_p, xs, ys, dx_um, n_core, n_bg, wavelength_nm, w_um, gap_um, npml, None

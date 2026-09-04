@@ -7,7 +7,7 @@ from coupler import analyze_coupler
 from detector import analyze_detector
 from fdtd.setup import run_fdtd
 from ring import analyze_ring
-from topology import run_topology
+from topology import run_robustness_sweep, run_topology
 from waveguide import analyze_waveguide
 
 app = FastAPI(title="Photonic Sensor Design")
@@ -139,6 +139,24 @@ def topology(payload: TopologyInput):
         beta=payload.beta,
         steps=payload.steps,
         kappa_target=payload.kappa_target,
+    )
+    if result.get("error"):
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
+
+
+@app.post("/api/topology/sweep")
+def topology_sweep(payload: TopologyInput):
+    result = run_robustness_sweep(
+        payload.width_nm,
+        payload.height_nm,
+        payload.wavelength_nm,
+        payload.n_clad,
+        payload.polarization,
+        payload.devices,
+        steps=min(payload.steps, 6) if payload.steps else 4,
+        kappa_target=payload.kappa_target,
+        beta=payload.beta,
     )
     if result.get("error"):
         raise HTTPException(status_code=400, detail=result["error"])
