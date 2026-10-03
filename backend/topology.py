@@ -10,10 +10,45 @@ from datetime import datetime, timezone
 import numpy as np
 
 from fdtd.geometry import Rect, Scene
+from thermo import (
+    DN_DT_SI,
+    bicgstab_field,
+    circuit_heat_grid,
+    circuit_masks,
+    circuit_si_density,
+    coupled_window_heat,
+    default_coupler_heater,
+    dn_clad_dt,
+    dn_eff_dt,
+    heat_field,
+    heater_layout,
+    heater_polygons,
+    mean_on_mask,
+    neighbor_sum,
+    paint_heaters,
+    resonance_shift_nm,
+    sheet_k,
+    solve_heat,
+    window_heat_gradient,
+)
+from thermo_adjoint import (
+    helmholtz_apply,
+    optical_adjoint_field,
+    permittivity_derivatives,
+    permittivity_gradient,
+    port_field_grad,
+    te_apply,
+    te_permittivity_gradient,
+    thermo_optic_terms,
+)
 from waveguide import analyze_waveguide
 
 # Dilated / intermediate / eroded thresholds. Wang, Lazarov & Sigmund 2011.
 _ROBUST_ETAS = (("dilated", 0.3), ("intermediate", 0.5), ("eroded", 0.7))
+# Forward and adjoint share this residual. A nonzero field is not a solution.
+_SOLVE_TOL = 1e-5
+_SOLVE_ITERS = 4000
+_MATERIAL_LOSS = 0.015
 
 
 def run_topology(
@@ -30,6 +65,7 @@ def run_topology(
     beta: float = 8.0,
     steps: int = 8,
     kappa_target: float | None = None,
+    thermo_optic: bool = False,
 ) -> dict:
     scene, w_um, length_um, gap_um = _coupler_scene(width_nm, devices)
     if scene is None:
@@ -37,8 +73,9 @@ def run_topology(
 
     # 2D Helmholtz is reliable on a short window; TO/GDS use that slice of the coupler.
     length_um = min(length_um, 3.6)
+    pad_um = 1.0 if thermo_optic else 0.4
     dx_um = _dx_for(w_um, length_um, gap_um)
-    xs, ys, rho0, design, guides = _raster(dx_um, w_um, length_um, gap_um)
+    xs, ys, rho0, design, guides = _raster(dx_um, w_um, length_um, gap_um, pad_um)
     r_px = float(np.clip(0.5 * mfs_nm / (dx_um * 1e3), 0.8, 2.4))
     beta = float(max(1.0, min(beta, 32.0)))
     steps = int(max(0, min(steps, 20)))
@@ -48,6 +85,46 @@ def run_topology(
     )
     n_core = float(mode["n_eff"]) if mode else 2.45
     n_bg = float(n_clad)
+    # Local index shift on the grid. The compact ring model keeps the overlap dn_eff/dT.
+    dndt_core = DN_DT_SI
+    dndt_clad = dn_clad_dt(n_clad)
+    etch = (etch_nm / (dx_um * 1e3), rounding_nm / (dx_um * 1e3))
+    heaters = []
+    heat_circuit = None
+    if thermo_optic:
+        laid = heater_layout(devices, width_nm)
+        if laid:
+            heaters = laid
+        else:
+            power = next(
+                (float(d.get("power_mw", 10.0)) for d in devices if d.get("type") == "heater"),
+                10.0,
+            )
+            heaters = [default_coupler_heater(w_um, length_um, pad_um, power)]
+        cxs, cys = circuit_heat_grid(width_nm, devices)
+        ring_mask, _coupler_mask = circuit_masks(cxs, cys, width_nm, devices)
+        dldt = 0.0
+        rings = [d for d in devices if d.get("type") == "ring"]
+        if rings and mode:
+            radius = float(rings[0].get("radius_um", 10.0))
+            length_ring = 2.0 * math.pi * radius
+            lam_um = wavelength_nm * 1e-3
+            order = round(n_core * length_ring / lam_um)
+            resonance_nm = n_core * length_ring / order * 1e3 if order else wavelength_nm
+            dldt = resonance_shift_nm(
+                resonance_nm,
+                float(mode["n_g"]),
+                dn_eff_dt(mode["gamma_core"], mode["gamma_clad"], n_clad),
+                1.0,
+            )
+        heat_circuit = {
+            "xs": cxs,
+            "ys": cys,
+            "rho_fixed": circuit_si_density(cxs, cys, width_nm, devices),
+            "q": paint_heaters(cxs, cys, heaters),
+            "ring": ring_mask,
+            "dldt": float(dldt),
+        }
 
     rho = rho0.copy()
     if design.any() and gap_um is not None:
@@ -74,6 +151,12 @@ def run_topology(
             w_um,
             gap_um,
             target,
+            heaters=heaters,
+            dndt_core=dndt_core,
+            dndt_clad=dndt_clad,
+            polarization=polarization,
+            etch=etch,
+            heat_circuit=heat_circuit,
         )
 
     rho_f = helmholtz_filter(rho, r_px)
@@ -97,16 +180,59 @@ def run_topology(
     robust = None
     if gap_um is not None:
         robust = _robust_splits(
-            variants, xs, ys, dx_um, n_core, n_bg, wavelength_nm, w_um, gap_um, target
+            {name: _etched(rho_p, design, etch) for name, rho_p in variants.items()},
+            xs,
+            ys,
+            dx_um,
+            n_core,
+            n_bg,
+            wavelength_nm,
+            w_um,
+            gap_um,
+            target,
+            polarization=polarization,
         )
         if robust and "intermediate" in robust:
             t_th = robust["intermediate"]["t_through"]
             t_dr = robust["intermediate"]["t_drop"]
 
+    thermal = None
+    field_t = None
+    if thermo_optic and gap_um is not None:
+        thermal = _thermal_report(
+            nominal,
+            xs,
+            ys,
+            dx_um,
+            n_core,
+            n_bg,
+            wavelength_nm,
+            w_um,
+            gap_um,
+            target,
+            heaters,
+            dndt_core,
+            dndt_clad,
+            guides,
+            polarization=polarization,
+            heat_circuit=heat_circuit,
+        )
+        if thermal:
+            field_t = thermal.pop("field", None)
+
     return {
         "filter": "Helmholtz PDE (Lazarov 2011)",
         "projection": "tanh / Heaviside, robust dilated–eroded (Wang 2011)",
-        "fabrication": "worst-case dilated/eroded κ in the loop (Piggott 2015; Wang 2011); morphological litho-etch after (not SEM-trained)",
+        "fabrication": (
+            "sum of dilated/intermediate/eroded κ errors in the loop (Piggott 2015; Wang 2011)"
+            + (
+                "; both heater states, (κ_hot − κ_off)², and the ring resonance shift; "
+                "chip-scale heat sampled into the coupler; optical and heat adjoints"
+                if thermo_optic
+                else ""
+            )
+            + "; morphological litho-etch inside the sensitivity and on the GDS (not SEM-trained)"
+        ),
         "vectorizer": "marching squares + Ramer–Douglas–Peucker",
         "dx_nm": dx_um * 1e3,
         "beta": beta,
@@ -130,10 +256,27 @@ def run_topology(
         "field_eroded": _density_field(xs, ys, eroded, [], guides, "eroded"),
         "field_ez": _with_guides(field_ez, guides),
         "eta_curve": _eta_split_curve(
-            rho_f, design, rho0, beta, xs, ys, dx_um, n_core, n_bg, wavelength_nm, w_um, gap_um, target
+            rho_f,
+            design,
+            rho0,
+            beta,
+            xs,
+            ys,
+            dx_um,
+            n_core,
+            n_bg,
+            wavelength_nm,
+            w_um,
+            gap_um,
+            target,
+            polarization=polarization,
+            etch=etch,
         )
         if gap_um is not None
         else None,
+        "thermo_optic": bool(thermo_optic),
+        "thermal": thermal,
+        "field_t": field_t,
     }
 
 
@@ -184,6 +327,7 @@ def run_robustness_sweep(
                 wavelength_nm,
                 target,
                 robust,
+                polarization,
             )
             rows.append(row)
             if robust and abs(mfs_nm - 150.0) < 1e-6:
@@ -205,19 +349,29 @@ def run_robustness_sweep(
     }
 
 
-def helmholtz_filter(rho: np.ndarray, r_px: float, niter: int = 48) -> np.ndarray:
-    """(I − r²∇²) ρ̃ = ρ with Neumann edges. Lazarov & Sigmund 2011."""
+def helmholtz_filter(rho: np.ndarray, r_px: float, niter: int = 48, clip: bool = True) -> np.ndarray:
+    """(I − r²∇²) ρ̃ = ρ with Neumann edges. Lazarov & Sigmund 2011.
+
+    The stencil is self-adjoint, so the same solve maps a ∂J/∂ρ̃ sensitivity
+    back to ∂J/∂ρ. Pass ``clip=False`` for that gradient; densities stay in [0, 1].
+    """
+    rhs = np.asarray(rho, dtype=float)
     if r_px < 0.35:
-        return rho.copy()
+        return np.clip(rhs, 0.0, 1.0) if clip else rhs.copy()
     r2 = float(r_px) ** 2
-    u = rho.astype(float).copy()
-    rhs = rho.astype(float)
-    den = 1.0 + 4.0 * r2
-    for _ in range(niter):
-        pad = np.pad(u, 1, mode="edge")
-        nb = pad[:-2, 1:-1] + pad[2:, 1:-1] + pad[1:-1, :-2] + pad[1:-1, 2:]
-        u = (rhs + r2 * nb) / den
-    return np.clip(u, 0.0, 1.0)
+
+    def apply(field):
+        return (1.0 + 4.0 * r2) * field - r2 * neighbor_sum(field)
+
+    u, ok = bicgstab_field(apply, rhs, tol=1e-8, maxiter=max(int(niter), 80))
+    if not ok or not np.isfinite(u).all():
+        den = 1.0 + 4.0 * r2
+        u = rhs.copy()
+        for _ in range(int(niter)):
+            u = (rhs + r2 * neighbor_sum(u)) / den
+    if clip:
+        u = np.clip(u, 0.0, 1.0)
+    return u
 
 
 def tanh_project(rho: np.ndarray, beta: float, eta: float = 0.5) -> np.ndarray:
@@ -237,15 +391,38 @@ def project_grad(rho: np.ndarray, beta: float, eta: float = 0.5) -> np.ndarray:
     return b * (1.0 - t * t) / max(den, 1e-12)
 
 
+def _etch_radius(round_px: float) -> float:
+    return max(float(round_px), 0.35)
+
+
+def _etch_eta(etch_px: float) -> float:
+    return float(np.clip(0.5 + 0.25 * np.tanh(float(etch_px) * 0.7), 0.15, 0.85))
+
+
+def _etched(rho_proj: np.ndarray, design: np.ndarray, etch) -> np.ndarray:
+    """Litho-etch inside the design window. ``etch`` is ``(etch_px, round_px)``."""
+    if etch is None:
+        return rho_proj
+    etched = litho_etch_surrogate(rho_proj, etch[0], etch[1])
+    return np.where(design, etched, rho_proj) if design.any() else etched
+
+
+def _etch_vjp(v: np.ndarray, rho: np.ndarray, etch_px: float, round_px: float) -> np.ndarray:
+    """Map ∂J/∂ρ_etched back through litho_etch_surrogate."""
+    radius = _etch_radius(round_px)
+    rounded = helmholtz_filter(rho, radius)
+    sens = np.asarray(v, dtype=float) * project_grad(rounded, 10.0, _etch_eta(etch_px))
+    return helmholtz_filter(sens, radius, clip=False)
+
+
 def litho_etch_surrogate(rho: np.ndarray, etch_px: float, round_px: float) -> np.ndarray:
     """Over/under-etch (threshold shift) and corner rounding (Helmholtz + reproject).
 
     Stand-in for SEM-trained litho/etch nets (Gostimirovic 2022) and FAID etch
     models (Raza 2024). Positive etch_px is over-etch (Si shrinks).
     """
-    rounded = helmholtz_filter(rho, max(float(round_px), 0.35))
-    eta = float(np.clip(0.5 + 0.25 * np.tanh(etch_px * 0.7), 0.15, 0.85))
-    return tanh_project(rounded, beta=10.0, eta=eta)
+    rounded = helmholtz_filter(rho, _etch_radius(round_px))
+    return tanh_project(rounded, beta=10.0, eta=_etch_eta(etch_px))
 
 
 def contours_to_polygons(
@@ -358,8 +535,7 @@ def _dx_for(w_um: float, length_um: float, gap_um: float | None) -> float:
     return dx
 
 
-def _raster(dx_um: float, w_um: float, length_um: float, gap_um: float | None):
-    pad = 0.4
+def _raster(dx_um: float, w_um: float, length_um: float, gap_um: float | None, pad: float = 0.4):
     x1 = (gap_um + w_um if gap_um is not None else 0.0) + pad
     xs = np.arange(-w_um - pad, x1 + dx_um * 0.5, dx_um)
     ys = np.arange(-pad, length_um + pad + dx_um * 0.5, dx_um)
@@ -419,6 +595,8 @@ def _eta_split_curve(
     gap_um,
     target,
     etas=_ETA_SWEEP,
+    polarization="TM",
+    etch=None,
 ):
     if gap_um is None:
         return None
@@ -426,9 +604,18 @@ def _eta_split_curve(
     worst = None
     worst_err = -1.0
     for eta in etas:
-        rho_p = _project_design(rho_f, design, rho_fixed, beta, eta)
+        rho_p = _etched(_project_design(rho_f, design, rho_fixed, beta, eta), design, etch)
         split, _, ok = _fdfd_split(
-            rho_p, xs, ys, dx_um, n_core, n_bg, wavelength_nm, w_um, gap_um
+            rho_p,
+            xs,
+            ys,
+            dx_um,
+            n_core,
+            n_bg,
+            wavelength_nm,
+            w_um,
+            gap_um,
+            polarization=polarization,
         )
         if not ok or not split:
             continue
@@ -467,6 +654,7 @@ def _sweep_case(
     wavelength_nm,
     target,
     robust: bool,
+    polarization: str = "TM",
 ):
     dx_um = _dx_for(w_um, length_um, gap_um)
     xs, ys, rho0, design, _guides = _raster(dx_um, w_um, length_um, gap_um)
@@ -490,12 +678,38 @@ def _sweep_case(
         gap_um,
         target,
         robust=robust,
+        polarization=polarization,
     )
     rho_f = helmholtz_filter(rho, r_px)
     variants = {name: _project_design(rho_f, design, rho0, beta, eta) for name, eta in _ROBUST_ETAS}
-    splits = _robust_splits(variants, xs, ys, dx_um, n_core, n_bg, wavelength_nm, w_um, gap_um, target)
+    splits = _robust_splits(
+        variants,
+        xs,
+        ys,
+        dx_um,
+        n_core,
+        n_bg,
+        wavelength_nm,
+        w_um,
+        gap_um,
+        target,
+        polarization=polarization,
+    )
     eta_curve = _eta_split_curve(
-        rho_f, design, rho0, beta, xs, ys, dx_um, n_core, n_bg, wavelength_nm, w_um, gap_um, target
+        rho_f,
+        design,
+        rho0,
+        beta,
+        xs,
+        ys,
+        dx_um,
+        n_core,
+        n_bg,
+        wavelength_nm,
+        w_um,
+        gap_um,
+        target,
+        polarization=polarization,
     )
     mid = splits.get("intermediate") if splits else None
     worst_abs = None
@@ -524,6 +738,22 @@ def _sweep_case(
     }
 
 
+def _coupled_hot(rho_window, xs, ys, heat):
+    """Chip heat for one blueprint, and the compact ring shift that heat produces."""
+    rho_c, inside, temp_c, temp_w = coupled_window_heat(
+        heat["xs"], heat["ys"], heat["rho_fixed"], heat["q"], rho_window, xs, ys
+    )
+    t_ring = mean_on_mask(temp_c, heat["ring"])
+    return {
+        "rho_c": rho_c,
+        "inside": inside,
+        "temp_c": temp_c,
+        "temp": temp_w,
+        "t_ring": t_ring,
+        "shift": float(heat["dldt"]) * t_ring,
+    }
+
+
 def _optimize(
     rho,
     design,
@@ -540,73 +770,165 @@ def _optimize(
     gap_um,
     target,
     robust: bool = True,
+    heaters: list | None = None,
+    dndt_core: float = 0.0,
+    dndt_clad: float = 0.0,
+    polarization: str = "TM",
+    etch=None,
+    heat_circuit=None,
 ):
-    """Piggott / Wang robust step: worst κ error of dilated, intermediate, eroded."""
+    """Sum the κ error of every scored blueprint, then step on that gradient.
+
+    With heaters, each blueprint adds heater-off, heater-on, (κ_hot − κ_off)²,
+    and the ring resonance shift. Heat is the chip-scale solve; the coupler
+    window samples that temperature. The grayscale penalty stays on the
+    intermediate projection before etch.
+    """
     history = []
     field_ez = None
     t_th = t_dr = None
     npml = max(8, int(round(0.32 / dx_um)))
     etas = _ROBUST_ETAS if robust else (("intermediate", 0.5),)
+    heaters = heaters or []
     for k in range(steps):
         beta = min(beta_final, 2.0 * (1.22**k))
         rho_f = helmholtz_filter(rho, r_px)
+        q_heat = paint_heaters(xs, ys, heaters) if heaters else None
         candidates = []
         for name, eta in etas:
-            rho_p = _project_design(rho_f, design, rho, beta, eta)
-            split, e_fwd, ok = _fdfd_split(
-                rho_p, xs, ys, dx_um, n_core, n_bg, wavelength_nm, w_um, gap_um, npml, None
-            )
-            if not ok or split is None:
-                continue
-            t_drop = float(split[1])
-            candidates.append(
-                {
-                    "name": name,
-                    "eta": eta,
-                    "rho_p": rho_p,
-                    "split": split,
-                    "e_fwd": e_fwd,
-                    "t_drop": t_drop,
-                    "err": (t_drop - target) ** 2,
-                }
-            )
+            rho_proj = _project_design(rho_f, design, rho, beta, eta)
+            rho_sim = _etched(rho_proj, design, etch)
+            temps = [("off", None)]
+            hot_state = None
+            if heaters:
+                if heat_circuit is not None:
+                    hot_state = _coupled_hot(rho_sim, xs, ys, heat_circuit)
+                    temps.append(("hot", hot_state["temp"]))
+                elif q_heat is not None:
+                    temps.append(("hot", solve_heat(xs, ys, q_heat, sheet_k(rho_sim))))
+            for tname, temp in temps:
+                split, e_fwd, ok = _fdfd_split(
+                    rho_sim,
+                    xs,
+                    ys,
+                    dx_um,
+                    n_core,
+                    n_bg,
+                    wavelength_nm,
+                    w_um,
+                    gap_um,
+                    npml,
+                    None,
+                    temp,
+                    dndt_core,
+                    dndt_clad,
+                    polarization=polarization,
+                )
+                if not ok or split is None:
+                    continue
+                t_drop = float(split[1])
+                candidates.append(
+                    {
+                        "name": name,
+                        "eta": eta,
+                        "thermal": tname,
+                        "temp": temp,
+                        "rho_p": rho_sim,
+                        "rho_proj": rho_proj,
+                        "split": split,
+                        "e_fwd": e_fwd,
+                        "t_drop": t_drop,
+                        "err": (t_drop - target) ** 2,
+                        "heat": hot_state if tname == "hot" else None,
+                        "shift_nm": hot_state["shift"] if tname == "hot" and hot_state else 0.0,
+                        "dt_ring_k": hot_state["t_ring"] if tname == "hot" and hot_state else 0.0,
+                    }
+                )
         if not candidates:
             break
         worst = max(candidates, key=lambda c: c["err"])
-        by_name = {c["name"]: c for c in candidates}
-        mid = by_name.get("intermediate", worst)
+        by_key = {(c["name"], c["thermal"]): c for c in candidates}
+        mid = by_key.get(("intermediate", "off")) or by_key.get(("intermediate", "hot"), worst)
         t_th, t_dr = mid["split"]
-        gray_rho = mid["rho_p"]
+        gray_rho = mid["rho_proj"]
         gray = _grayscale(gray_rho[design]) if design.any() else _grayscale(gray_rho)
-        obj = worst["err"] + 0.02 * (beta / max(beta_final, 1.0)) * gray
+        gray_w = 0.02 * (beta / max(beta_final, 1.0))
+        scored = 0.0
+        drift = 0.0
+        pieces = []
+        complete = True
+        heat_used = False
+        for name, _eta in etas:
+            off_c = by_key.get((name, "off"))
+            hot_c = by_key.get((name, "hot"))
+            if off_c is None or (heaters and hot_c is None):
+                complete = False
+                continue
+            scored += _pair_objective(off_c, hot_c, target)
+            if hot_c is not None:
+                scored += hot_c.get("shift_nm", 0.0) ** 2
+            if off_c is not None and hot_c is not None:
+                drift += (hot_c["t_drop"] - off_c["t_drop"]) ** 2
+            heat_used = heat_used or hot_c is not None
+            piece = _desensitization_sensitivity(
+                off_c,
+                hot_c,
+                rho_f,
+                design,
+                xs,
+                ys,
+                dx_um,
+                r_px,
+                beta,
+                n_core,
+                n_bg,
+                wavelength_nm,
+                w_um,
+                gap_um,
+                target,
+                npml,
+                dndt_core,
+                dndt_clad,
+                polarization=polarization,
+                etch=etch,
+                heat_circuit=heat_circuit,
+            )
+            if piece is None:
+                complete = False
+            else:
+                pieces.append(piece)
+        obj = scored + gray_w * gray
         rec = {
             "step": k + 1,
             "objective": float(obj),
             "t_drop": float(worst["t_drop"]),
             "worst": worst["name"],
+            "thermal": worst["thermal"],
+            "drift": float(drift),
             "beta": float(beta),
         }
         for name, _eta in _ROBUST_ETAS:
-            if name in by_name:
-                rec[f"t_drop_{name}"] = by_name[name]["t_drop"]
+            off = by_key.get((name, "off"))
+            hot = by_key.get((name, "hot"))
+            if off:
+                rec[f"t_drop_{name}"] = off["t_drop"]
+            if hot:
+                rec[f"t_drop_{name}_hot"] = hot["t_drop"]
+        if by_key.get(("intermediate", "off")) and by_key.get(("intermediate", "hot")):
+            rec["t_drop_off"] = by_key[("intermediate", "off")]["t_drop"]
+            rec["t_drop_hot"] = by_key[("intermediate", "hot")]["t_drop"]
+            rec["shift_nm"] = by_key[("intermediate", "hot")].get("shift_nm", 0.0)
+            rec["dt_ring_k"] = by_key[("intermediate", "hot")].get("dt_ring_k", 0.0)
         history.append(rec)
-        w_th, w_dr = worst["split"]
-        dL_dE = _adjoint_source(
-            worst["e_fwd"], xs, dx_um, w_um, gap_um, w_th, w_dr, target, npml
-        )
-        e_adj, aok = _fdfd_solve(
-            worst["rho_p"], xs, ys, dx_um, n_core, n_bg, wavelength_nm, -dL_dE, npml, None
-        )
         if mid["e_fwd"] is not None:
             field_ez = _ez_field(xs, ys, mid["e_fwd"])
-        if not aok or not np.isfinite(e_adj).all():
+        if not complete or not pieces:
             continue
-        k0 = 2 * math.pi / (wavelength_nm * 1e-3)
-        deps = n_core**2 - n_bg**2
-        sens = np.real(worst["e_fwd"] * e_adj) * (k0**2) * deps
-        sens *= project_grad(rho_f, beta, worst["eta"])
-        sens = helmholtz_filter(sens, r_px)
-        sens *= design
+        sens = pieces[0]
+        for piece in pieces[1:]:
+            sens = sens + piece
+        sens = sens + _grayscale_sensitivity(rho_f, design, beta, gray_w, r_px)
+        rec["gradient"] = "optical+heat" if heat_used else "optical"
         peak = float(np.max(np.abs(sens[design]))) if design.any() else 1.0
         step = 0.05 * sens / (peak + 1e-12)
         updated = np.clip(rho - step, 0.0, 1.0)
@@ -614,8 +936,112 @@ def _optimize(
     return rho, history, t_th, t_dr, field_ez
 
 
+def _thermal_report(
+    rho,
+    xs,
+    ys,
+    dx_um,
+    n_core,
+    n_bg,
+    wavelength_nm,
+    w_um,
+    gap_um,
+    target,
+    heaters,
+    dndt_core,
+    dndt_clad,
+    guides,
+    polarization="TM",
+    heat_circuit=None,
+):
+    if not heaters:
+        return None
+    hot_state = _coupled_hot(rho, xs, ys, heat_circuit) if heat_circuit is not None else None
+    t_hot = hot_state["temp"] if hot_state is not None else solve_heat(
+        xs, ys, paint_heaters(xs, ys, heaters), sheet_k(rho)
+    )
+    npml = max(8, int(round(0.32 / dx_um)))
+    cold, _, cok = _fdfd_split(
+        rho,
+        xs,
+        ys,
+        dx_um,
+        n_core,
+        n_bg,
+        wavelength_nm,
+        w_um,
+        gap_um,
+        npml,
+        polarization=polarization,
+    )
+    hot, _, hok = _fdfd_split(
+        rho,
+        xs,
+        ys,
+        dx_um,
+        n_core,
+        n_bg,
+        wavelength_nm,
+        w_um,
+        gap_um,
+        npml,
+        None,
+        t_hot,
+        dndt_core,
+        dndt_clad,
+        polarization=polarization,
+    )
+    t_off = float(cold[1]) if cok and cold else None
+    t_on = float(hot[1]) if hok and hot else None
+    heat_guides = list(guides)
+    heat_guides.extend(
+        {
+            "x0": float(h["x0"]),
+            "y0": float(h["y0"]),
+            "width": float(h["width"]),
+            "height": float(h["height"]),
+        }
+        for h in heaters
+    )
+    return {
+        "source": "2D BOX-sink heat PDE + FDFD ε(T)",
+        "layout": heaters,
+        "power_mw": float(sum(h["power_mw"] for h in heaters)),
+        "dt_max_k": float(hot_state["temp_c"].max()) if hot_state is not None else float(t_hot.max()),
+        "dt_ring_k": hot_state["t_ring"] if hot_state is not None else None,
+        "shift_nm": hot_state["shift"] if hot_state is not None else None,
+        "t_drop_off": t_off,
+        "t_drop_hot": t_on,
+        "abs_dkappa": abs((t_on or 0.0) - (t_off or 0.0)) if t_off is not None and t_on is not None else None,
+        "kappa_target": float(target),
+        "note": (
+            "Heat is the chip-scale BOX-sink solve, with this blueprint’s litho-etched "
+            "silicon pasted into the coupler window. The coupler field uses that temperature. "
+            "The ring shift is (λ / n_g) dn_eff/dT · ΔT_ring from the same heat solution, "
+            "and the heat adjoint carries both the coupler and the ring back to the density."
+        ),
+        "field": heat_field(
+            heat_circuit["xs"] if hot_state is not None else xs,
+            heat_circuit["ys"] if hot_state is not None else ys,
+            hot_state["temp_c"] if hot_state is not None else t_hot,
+            heat_guides,
+            heater_polygons(heaters),
+        ),
+    }
+
+
 def _robust_splits(
-    variants, xs, ys, dx_um, n_core, n_bg, wavelength_nm, w_um, gap_um, target
+    variants,
+    xs,
+    ys,
+    dx_um,
+    n_core,
+    n_bg,
+    wavelength_nm,
+    w_um,
+    gap_um,
+    target,
+    polarization="TM",
 ):
     npml = max(8, int(round(0.32 / dx_um)))
     out = {}
@@ -623,7 +1049,17 @@ def _robust_splits(
     worst_err = -1.0
     for name, rho_p in variants.items():
         split, _, ok = _fdfd_split(
-            rho_p, xs, ys, dx_um, n_core, n_bg, wavelength_nm, w_um, gap_um, npml
+            rho_p,
+            xs,
+            ys,
+            dx_um,
+            n_core,
+            n_bg,
+            wavelength_nm,
+            w_um,
+            gap_um,
+            npml,
+            polarization=polarization,
         )
         if not ok or not split:
             continue
@@ -638,13 +1074,21 @@ def _robust_splits(
     return out or None
 
 
-def _eps_pml(rho, xs, ys, dx_um, n_core, n_bg, wavelength_nm, npml=8):
+def _eps_pml(
+    rho, xs, ys, dx_um, n_core, n_bg, wavelength_nm, npml=8, temp=None, dndt_core=0.0, dndt_clad=0.0
+):
     """Permittivity on a μm grid. Small background loss + PML keeps FDFD stable."""
-    eps = n_bg**2 + np.clip(rho, 0, 1) * (n_core**2 - n_bg**2)
+    if temp is None:
+        n_c, n_b = n_core, n_bg
+    else:
+        t = np.asarray(temp, dtype=float)
+        n_c = n_core + float(dndt_core) * t
+        n_b = n_bg + float(dndt_clad) * t
+    eps_r = n_b**2 + np.clip(rho, 0, 1) * (n_c**2 - n_b**2)
     lam = wavelength_nm * 1e-3
     k0 = 2 * math.pi / lam
-    sigma = np.zeros_like(eps)
-    nx, ny = eps.shape
+    sigma = np.zeros(eps_r.shape, dtype=float)
+    nx, ny = eps_r.shape
     for i in range(npml):
         r = ((npml - i) / npml) ** 2
         s = 1.6 * r
@@ -655,7 +1099,8 @@ def _eps_pml(rho, xs, ys, dx_um, n_core, n_bg, wavelength_nm, npml=8):
         s = 1.6 * r
         sigma[:, j] += s
         sigma[:, -1 - j] += s
-    eps = eps + 1j * (0.015 + sigma) * (n_core**2)
+    # Material loss scales with the real permittivity. The PML sponge does not.
+    eps = eps_r * (1.0 + 1j * _MATERIAL_LOSS) + 1j * sigma * (float(n_core) ** 2)
     return eps, k0, npml
 
 
@@ -667,9 +1112,45 @@ def _jsrc_jmon(ny: int, npml: int, dx_um: float) -> tuple[int, int]:
     return jsrc, max(jmon, jsrc + 8)
 
 
-def _fdfd_split(rho, xs, ys, dx_um, n_core, n_bg, wavelength_nm, w_um, gap_um, npml=8, x0=None):
+def _fdfd_split(
+    rho,
+    xs,
+    ys,
+    dx_um,
+    n_core,
+    n_bg,
+    wavelength_nm,
+    w_um,
+    gap_um,
+    npml=8,
+    x0=None,
+    temp=None,
+    dndt_core=0.0,
+    dndt_clad=0.0,
+    *,
+    polarization="TM",
+    tol=_SOLVE_TOL,
+    maxiter=_SOLVE_ITERS,
+):
     src = _src_profile(xs, w_um)
-    e, ok = _fdfd_solve(rho, xs, ys, dx_um, n_core, n_bg, wavelength_nm, src, npml, x0)
+    e, ok = _fdfd_solve(
+        rho,
+        xs,
+        ys,
+        dx_um,
+        n_core,
+        n_bg,
+        wavelength_nm,
+        src,
+        npml,
+        x0,
+        temp,
+        dndt_core,
+        dndt_clad,
+        polarization=polarization,
+        tol=tol,
+        maxiter=maxiter,
+    )
     if not ok:
         return None, e, False
     jsrc, jmon = _jsrc_jmon(ys.size, npml, dx_um)
@@ -690,8 +1171,27 @@ def _src_profile(xs, w_um):
     return src
 
 
-def _fdfd_solve(rho, xs, ys, dx_um, n_core, n_bg, wavelength_nm, src_x, npml=8, x0=None):
-    eps, k0, npml = _eps_pml(rho, xs, ys, dx_um, n_core, n_bg, wavelength_nm, npml)
+def _fdfd_solve(
+    rho,
+    xs,
+    ys,
+    dx_um,
+    n_core,
+    n_bg,
+    wavelength_nm,
+    src_x,
+    npml=8,
+    x0=None,
+    temp=None,
+    dndt_core=0.0,
+    dndt_clad=0.0,
+    polarization="TM",
+    tol=_SOLVE_TOL,
+    maxiter=_SOLVE_ITERS,
+):
+    eps, k0, npml = _eps_pml(
+        rho, xs, ys, dx_um, n_core, n_bg, wavelength_nm, npml, temp, dndt_core, dndt_clad
+    )
     dx = float(dx_um)
     jsrc, _ = _jsrc_jmon(eps.shape[1], npml, dx)
     b = np.zeros_like(eps, dtype=complex)
@@ -703,72 +1203,244 @@ def _fdfd_solve(rho, xs, ys, dx_um, n_core, n_bg, wavelength_nm, src_x, npml=8, 
     else:
         b += src_x * scale
 
-    def op(u):
-        p = np.pad(u, 1, mode="constant")
-        lap = p[:-2, 1:-1] + p[2:, 1:-1] + p[1:-1, :-2] + p[1:-1, 2:] - 4 * p[1:-1, 1:-1]
-        return lap / dx**2 + (k0**2) * eps * u
+    apply = te_apply if str(polarization).upper() == "TE" else helmholtz_apply
+    e, ok = _cocg(
+        lambda u: apply(u, eps, k0, dx),
+        -b,
+        x0=x0,
+        tol=tol,
+        maxiter=maxiter,
+    )
+    return e, bool(ok and np.isfinite(e).all())
 
-    e, ok = _bicgstab(op, -b, x0=x0, tol=1.5e-3, maxiter=320)
-    usable = bool(np.isfinite(e).all() and np.abs(e).max() > 1e-8)
-    return e, ok or usable
+
+def _port_masks(xs, w_um, gap_um):
+    through = np.abs(xs + w_um / 2) <= w_um * 0.85
+    drop = np.abs(xs - (gap_um + w_um / 2)) <= w_um * 0.85
+    return through, drop
 
 
-def _adjoint_source(e_fwd, xs, dx_um, w_um, gap_um, t_th, t_dr, target, npml=8):
-    """Gradient of (T_drop − target)² through the normalized port split."""
+def _pair_objective(off, hot, target) -> float:
+    """(T_off − target)² + (T_hot − target)² + (T_hot − T_off)² for the states that exist."""
+    total = 0.0
+    if off is not None:
+        total += (off["t_drop"] - target) ** 2
+    if hot is not None:
+        total += (hot["t_drop"] - target) ** 2
+    if off is not None and hot is not None:
+        total += (hot["t_drop"] - off["t_drop"]) ** 2
+    return float(total)
+
+
+def _state_weight(corner, other, target, track_target):
+    """∂J/∂T_drop for one state of _pair_objective, when track_target is set."""
+    weight = 2.0 * (corner["t_drop"] - target) if track_target else 0.0
+    if other is None:
+        return weight
+    t_hot = corner["t_drop"] if corner["thermal"] == "hot" else other["t_drop"]
+    t_off = other["t_drop"] if corner["thermal"] == "hot" else corner["t_drop"]
+    sign = 1.0 if corner["thermal"] == "hot" else -1.0
+    return weight + sign * 2.0 * (t_hot - t_off)
+
+
+def _desensitization_sensitivity(
+    off,
+    hot,
+    rho_f,
+    design,
+    xs,
+    ys,
+    dx_um,
+    r_px,
+    beta,
+    n_core,
+    n_bg,
+    wavelength_nm,
+    w_um,
+    gap_um,
+    target,
+    npml,
+    dndt_core,
+    dndt_clad,
+    adj_tol=_SOLVE_TOL,
+    polarization="TM",
+    etch=None,
+    heat_circuit=None,
+):
+    """Density gradient of one blueprint: both temperatures, including the drift.
+
+    Each existing state is differentiated with track_target, which is the
+    derivative of _pair_objective. A missing adjoint drops the whole blueprint.
+    """
+    acc = None
+    for corner, other in ((off, hot), (hot, off)):
+        if corner is None:
+            continue
+        piece = _density_sensitivity(
+            corner,
+            rho_f,
+            design,
+            xs,
+            ys,
+            dx_um,
+            r_px,
+            beta,
+            n_core,
+            n_bg,
+            wavelength_nm,
+            w_um,
+            gap_um,
+            target,
+            npml,
+            dndt_core,
+            dndt_clad,
+            dJ_dt=_state_weight(corner, other, target, True),
+            adj_tol=adj_tol,
+            polarization=polarization,
+            etch=etch,
+            heat_circuit=heat_circuit,
+        )
+        if piece is None:
+            return None
+        acc = piece if acc is None else acc + piece
+    return acc
+
+
+def _density_sensitivity(
+    corner,
+    rho_f,
+    design,
+    xs,
+    ys,
+    dx_um,
+    r_px,
+    beta,
+    n_core,
+    n_bg,
+    wavelength_nm,
+    w_um,
+    gap_um,
+    target,
+    npml,
+    dndt_core,
+    dndt_clad,
+    dJ_dt=None,
+    adj_tol=_SOLVE_TOL,
+    polarization="TM",
+    etch=None,
+    heat_circuit=None,
+):
+    """∂J/∂ρ for one heater state, with ∂J/∂T_drop = ``dJ_dt``.
+
+    Chains the optical adjoint through ε(ρ, T) of the litho-etched blueprint.
+    When the heater is on, the adjoint heat equation differentiates that
+    conductivity. The etch map, the projection, and the Helmholtz filter then
+    carry the sensitivity back to the design density.
+    """
+    e_fwd = corner["e_fwd"]
+    rho_sim = corner["rho_p"]
+    rho_proj = corner.get("rho_proj", rho_sim)
+    temp = corner.get("temp")
+    eps, k0, _ = _eps_pml(
+        rho_sim, xs, ys, dx_um, n_core, n_bg, wavelength_nm, npml, temp, dndt_core, dndt_clad
+    )
     _, jmon = _jsrc_jmon(e_fwd.shape[1], npml, dx_um)
-    th = np.abs(xs + w_um / 2) <= w_um * 0.85
-    dr = np.abs(xs - (gap_um + w_um / 2)) <= w_um * 0.85
-    tot = t_th + t_dr + 1e-30
-    dL = 2.0 * (t_dr - target)
-    src = np.zeros_like(e_fwd)
-    src[dr, jmon] = dL * (t_th / tot) * e_fwd[dr, jmon]
-    src[th, jmon] = dL * (-t_dr / tot) * e_fwd[th, jmon]
-    return src
+    through, drop = _port_masks(xs, w_um, gap_um)
+    field_grad = port_field_grad(e_fwd, through, drop, jmon, target, dJ_dt=dJ_dt)
+    te = str(polarization).upper() == "TE"
+    apply = te_apply if te else helmholtz_apply
+    lam, ok = optical_adjoint_field(
+        eps,
+        k0,
+        dx_um,
+        field_grad,
+        apply=apply,
+        solve=lambda op, rhs: _cocg(op, rhs, tol=adj_tol, maxiter=_SOLVE_ITERS),
+    )
+    if not ok:
+        return None
+    if te:
+        dJ_deps = te_permittivity_gradient(e_fwd, lam, eps, k0, dx_um, loss=_MATERIAL_LOSS)
+    else:
+        dJ_deps = permittivity_gradient(e_fwd, lam, k0, loss=_MATERIAL_LOSS)
+    hot = corner.get("heat")
+    if hot is not None and heat_circuit is not None:
+        d_rho, d_t = permittivity_derivatives(
+            rho_sim, temp, n_core, n_bg, dndt_core, dndt_clad
+        )
+        direct = np.asarray(dJ_deps, dtype=float) * d_rho
+        dJ_dT = np.asarray(dJ_deps, dtype=float) * (0.0 if d_t is None else d_t)
+        thermal = window_heat_gradient(
+            heat_circuit["xs"],
+            heat_circuit["ys"],
+            hot["rho_c"],
+            hot["inside"],
+            hot["temp_c"],
+            xs,
+            ys,
+            dJ_dT,
+            heat_circuit["ring"],
+            2.0 * float(hot["shift"]) * float(heat_circuit["dldt"]),
+        )
+    else:
+        direct, thermal = thermo_optic_terms(
+            dJ_deps,
+            rho_sim,
+            temp,
+            rho_sim,
+            xs,
+            n_core,
+            n_bg,
+            dndt_core,
+            dndt_clad,
+        )
+    sens_sim = direct + thermal
+    if etch is None:
+        sens_proj = sens_sim
+    else:
+        sens_proj = _etch_vjp(np.where(design, sens_sim, 0.0), rho_proj, etch[0], etch[1])
+    sens_f = np.where(design, sens_proj * project_grad(rho_f, beta, corner["eta"]), 0.0)
+    return helmholtz_filter(sens_f, r_px, clip=False) * design
 
 
-def _bicgstab(op, b, x0=None, tol=1.5e-3, maxiter=320):
-    x = np.zeros_like(b) if x0 is None else x0.copy()
-    r = b - op(x)
-    r0 = r.copy()
-    rho = alpha = omega = 1.0 + 0j
-    v = np.zeros_like(b)
-    p = np.zeros_like(b)
+def _cocg(op, b, x0=None, tol=_SOLVE_TOL, maxiter=_SOLVE_ITERS):
+    """COCG for the complex-symmetric TM and TE operators. Success means the residual."""
+    b = np.asarray(b)
+    x = np.zeros_like(b) if x0 is None else np.array(x0, copy=True)
     bnorm = np.linalg.norm(b) + 1e-30
     best = x
-    best_rel = np.linalg.norm(r) / bnorm
-    for _ in range(maxiter):
-        rho_n = np.vdot(r0, r)
-        if abs(rho_n) < 1e-20:
-            r0 = r.copy()
-            rho_n = np.vdot(r0, r)
-        beta = (rho_n / (rho + 1e-30)) * (alpha / (omega + 1e-30))
-        p = r + beta * (p - omega * v)
-        v = op(p)
-        den = np.vdot(r0, v)
-        if abs(den) < 1e-20:
-            return best, best_rel < 0.08
-        alpha = rho_n / den
-        h = x + alpha * p
-        s = r - alpha * v
-        rel_s = np.linalg.norm(s) / bnorm
-        if rel_s < best_rel:
-            best, best_rel = h, rel_s
-        if rel_s < tol:
-            return h, True
-        t = op(s)
-        t2 = np.vdot(t, t)
-        if abs(t2) < 1e-20:
-            return best, best_rel < 0.08
-        omega = np.vdot(t, s) / t2
-        x = h + omega * s
-        r = s - omega * t
-        rel = np.linalg.norm(r) / bnorm
-        if rel < best_rel:
-            best, best_rel = x, rel
-        if rel < tol:
-            return x, True
-        rho = rho_n
-    return best, bool(np.isfinite(best).all() and best_rel < 0.08)
+    best_rel = np.inf
+    used = 0
+    for _restart in range(6):
+        if used >= maxiter:
+            break
+        r = b - op(x)
+        rel = float(np.linalg.norm(r) / bnorm)
+        if np.isfinite(rel) and rel < best_rel:
+            best, best_rel = x.copy(), rel
+        if best_rel <= tol:
+            return best, True
+        p = r.copy()
+        rho = np.sum(r * r)
+        while used < maxiter:
+            q = op(p)
+            den = np.sum(p * q)
+            if abs(den) < 1e-18 or abs(rho) < 1e-30:
+                break
+            alpha = rho / den
+            x = x + alpha * p
+            r = r - alpha * q
+            used += 1
+            rel = float(np.linalg.norm(r) / bnorm)
+            if np.isfinite(rel) and rel < best_rel:
+                best, best_rel = x.copy(), rel
+            if best_rel <= tol:
+                return best, True
+            rho_n = np.sum(r * r)
+            p = r + (rho_n / rho) * p
+            rho = rho_n
+        x = best.copy()
+    return best, bool(np.isfinite(best).all() and best_rel <= tol)
 
 
 def _drc(binary: np.ndarray, dx_um: float, mfs_nm: float, min_gap_nm: float) -> dict:
@@ -843,6 +1515,18 @@ def _drop_speckles(binary: np.ndarray, min_pix: int) -> np.ndarray:
 
 def _grayscale(rho: np.ndarray) -> float:
     return float(np.mean(4.0 * rho * (1.0 - rho)))
+
+
+def _grayscale_sensitivity(rho_f, design, beta, weight, r_px, eta=0.5):
+    """∂/∂ρ of weight * mean(4 ρ_p (1 − ρ_p)) on the intermediate projection."""
+    if weight == 0.0 or not np.any(design):
+        return np.zeros_like(rho_f, dtype=float)
+    rho_p = tanh_project(rho_f, beta, eta)
+    n = float(np.count_nonzero(design))
+    dJ = np.zeros_like(rho_f, dtype=float)
+    dJ[design] = weight * 4.0 * (1.0 - 2.0 * rho_p[design]) / n
+    sens_f = np.where(design, dJ * project_grad(rho_f, beta, eta), 0.0)
+    return helmholtz_filter(sens_f, r_px, clip=False) * design
 
 
 def _marching_squares(z, xs, ys, iso=0.5):

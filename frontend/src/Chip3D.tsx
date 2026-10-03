@@ -24,6 +24,15 @@ export type Chip3DDevice =
       dark_current_na: number;
       bandwidth_mhz: number;
       load_ohm: number;
+    }
+  | {
+      id: string;
+      type: "heater";
+      x: number;
+      y: number;
+      power_mw: number;
+      width_um: number;
+      length_um: number;
     };
 
 type Props = {
@@ -42,6 +51,7 @@ const SI = 0x5c6770;
 const THROUGH = 0x2f6f6a;
 const DROP = 0x1d6a93;
 const GE = 0xb4bcc6;
+const HEATER = 0xd4b06a;
 const BOX = 0xe8e4d8;
 
 type BusRole = "through" | "drop" | "waveguide";
@@ -120,6 +130,7 @@ function layoutKeyOf(devices: Chip3DDevice[], widthNm: number, heightNm: number,
       if (d.type === "ring") return [d.id, d.type, d.x, d.y, d.radius_um, d.config];
       if (d.type === "waveguide") return [d.id, d.type, d.x, d.y, d.length_um];
       if (d.type === "coupler") return [d.id, d.type, d.x, d.y, d.gap_nm, d.length_um];
+      if (d.type === "heater") return [d.id, d.type, d.x, d.y, d.power_mw, d.width_um, d.length_um];
       return [d.id, d.type, d.x, d.y];
     }),
   });
@@ -251,6 +262,11 @@ function buildLayout(
       maxX = Math.max(maxX, d.x + r);
       minY = Math.min(minY, d.y - r);
       maxY = Math.max(maxY, d.y + r);
+    } else if (d.type === "heater") {
+      minX = Math.min(minX, d.x - 18);
+      maxX = Math.max(maxX, d.x + 18);
+      minY = Math.min(minY, d.y - 8);
+      maxY = Math.max(maxY, d.y + 8);
     } else {
       minX = Math.min(minX, d.x - 16);
       maxX = Math.max(maxX, d.x + 16);
@@ -337,6 +353,35 @@ function buildLayout(
       const label = makeLabel(d.config === "add-drop" ? "ring (add-drop)" : "ring", "ring");
       label.position.set(p.x, siH + 24, p.z);
       engine.root.add(label);
+    } else if (d.type === "heater") {
+      const ringNear = nearestRing(d.x, d.y, devices);
+      if (ringNear) {
+        const r = ringPx(ringNear.radius_um);
+        const arc = Math.min(4.7, Math.max(3.4, (2 * d.length_um) / Math.max(ringNear.radius_um, 6)));
+        const geo = new THREE.TorusGeometry(r, Math.max(1.6, d.width_um * 0.85), 8, 36, arc);
+        const mesh = new THREE.Mesh(geo, sharedMat(engine, HEATER));
+        const p = toWorld(ringNear.x, ringNear.y);
+        mesh.position.set(p.x, siH * 1.05, p.z);
+        mesh.rotation.x = Math.PI / 2;
+        mesh.rotation.z = Math.atan2(d.y - ringNear.y, d.x - ringNear.x) - arc / 2;
+        mesh.userData.deviceId = d.id;
+        engine.pickables.push(mesh);
+        engine.baseColors.set(mesh, HEATER);
+        engine.deviceCenters.set(d.id, new THREE.Vector3(p.x, siH * 1.05, p.z));
+        engine.root.add(mesh);
+        const lp = toWorld(d.x, d.y);
+        const label = makeLabel("heater", "muted");
+        label.position.set(lp.x, siH + 22, lp.z);
+        engine.root.add(label);
+      } else {
+        const hw = Math.max(22, Math.min(40, d.length_um * 0.7));
+        const hd = Math.max(5, Math.min(10, d.width_um * 3));
+        addBox(d.x - hw / 2, d.y - hd / 2, hw, hd, siH * 0.85, siH * 0.45, HEATER, d.id);
+        const p = toWorld(d.x, d.y);
+        const label = makeLabel("heater", "muted");
+        label.position.set(p.x, siH + 20, p.z);
+        engine.root.add(label);
+      }
     } else {
       addBox(d.x - 12, d.y - 9, 24, 18, 0, siH * 0.75, GE, d.id);
       const p = toWorld(d.x, d.y);

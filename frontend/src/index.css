@@ -785,7 +785,8 @@ button:focus-visible {
 
 .circuit-svg .seg.selected .device-line,
 .circuit-svg .seg.selected .bus,
-.circuit-svg .seg.selected .detector {
+.circuit-svg .seg.selected .detector,
+.circuit-svg .seg.selected .heater {
   stroke: var(--accent);
   stroke-width: 3;
 }
@@ -800,6 +801,40 @@ button:focus-visible {
   fill: #ecece6;
   stroke: var(--ink);
   stroke-width: 2;
+}
+
+.circuit-svg .heater {
+  fill: none;
+  stroke: #c4a35a;
+  stroke-width: 4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.circuit-svg rect.heater {
+  fill: #d4b06a;
+  stroke: #8a7028;
+  stroke-width: 1.6;
+}
+
+.circuit-svg .heater-hit {
+  fill: none;
+  stroke: transparent;
+  stroke-width: 16;
+  stroke-linecap: round;
+}
+
+.circuit-svg path.halo {
+  fill: none;
+  stroke-width: 6;
+}
+
+.circuit-svg .seg.selected .heater {
+  stroke: var(--accent);
+}
+
+.circuit-svg .seg.selected rect.heater {
+  fill: #e4c888;
 }
 
 .circuit-svg .seg.selected .detector {
