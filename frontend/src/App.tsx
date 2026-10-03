@@ -311,6 +311,10 @@ type TopologyResult = {
     beta: number;
     worst?: "dilated" | "intermediate" | "eroded";
     thermal?: "off" | "hot";
+    drift?: number;
+    shift_nm?: number;
+    dt_ring_k?: number;
+    gradient?: "optical" | "optical+heat";
     t_drop_dilated?: number;
     t_drop_intermediate?: number;
     t_drop_eroded?: number;
@@ -338,6 +342,8 @@ type TopologyResult = {
     source: string;
     power_mw: number;
     dt_max_k: number;
+    dt_ring_k?: number | null;
+    shift_nm?: number | null;
     t_drop_off: number | null;
     t_drop_hot: number | null;
     abs_dkappa: number | null;
@@ -2323,32 +2329,29 @@ function topologyObjectiveNote(report: TopologyResult): string {
   const ratio = end / (Math.abs(start) > 1e-12 ? start : 1e-12);
   let trend: string;
   if (end < 1e-4) {
-    trend = `ended near zero (${fmt(end, 4)}), so the worst blueprint is on the κ target`;
+    trend = `ended near zero (${fmt(end, 4)}), so the scored blueprints are on the κ target`;
   } else if (ratio < 0.7) {
-    trend = `fell from ${fmt(start, 3)} to ${fmt(end, 3)}, so the worst blueprint moved closer to the target`;
+    trend = `fell from ${fmt(start, 3)} to ${fmt(end, 3)}, so the scored blueprints moved closer to the target`;
   } else if (ratio > 1.2) {
-    trend = `rose from ${fmt(start, 3)} to ${fmt(end, 3)}; the worst-case split did not improve`;
+    trend = `rose from ${fmt(start, 3)} to ${fmt(end, 3)}; the scored splits did not improve`;
   } else {
-    trend = `stayed near ${fmt(end, 3)}; the worst-case error barely moved`;
+    trend = `stayed near ${fmt(end, 3)}; the scored error barely moved`;
   }
-  const counts = { dilated: 0, intermediate: 0, eroded: 0 };
-  for (const step of h) {
-    if (step.worst) counts[step.worst] += 1;
-  }
-  const counted = (Object.entries(counts) as [keyof typeof counts, number][]).filter(
-    ([, n]) => n > 0
-  );
-  const who =
-    counted.length > 0
-      ? ` The adjoint used ${counted.map(([name, n]) => `${name} on ${n} step${n === 1 ? "" : "s"}`).join(", ")}.`
-      : "";
   const tgt = target != null ? ` Target κ is ${fmt(target, 2)}.` : "";
-  const lastWorst = last.worst ? ` Last update was the ${last.worst} geometry.` : "";
+  const lastWorst = last.worst ? ` The farthest blueprint on the last step was the ${last.worst} geometry.` : "";
   const hot =
     last.t_drop_off != null && last.t_drop_hot != null
       ? ` Last intermediate κ is ${fmt(last.t_drop_off, 3)} off and ${fmt(last.t_drop_hot, 3)} hot.`
       : "";
-  return `Each point is the largest (T_drop − κ)² among dilated / intermediate / eroded${report.thermo_optic ? " and heater off/on" : ""}, plus a small grayscale penalty on the intended layout.${tgt} The curve ${trend}.${who}${lastWorst}${hot}`;
+  const shift =
+    last.shift_nm != null ? ` Last ring shift is ${fmt(last.shift_nm, 3)} nm.` : "";
+  const scored = report.thermo_optic
+    ? "the sum of (T_drop − κ)² over dilated, intermediate, and eroded, each at heater off and on, plus (κ_hot − κ_off)² and the ring (Δλ)² on every blueprint"
+    : "the sum of (T_drop − κ)² over dilated, intermediate, and eroded";
+  const both = report.thermo_optic
+    ? " Heat is the chip-scale solve, sampled onto the coupler. The ring shift uses that same temperature, and both enter the heat adjoint."
+    : " Every step differentiates dilated, intermediate, and eroded.";
+  return `Each point is ${scored}, plus a small grayscale penalty on the intended layout.${tgt} The curve ${trend}.${both}${lastWorst}${hot}${shift}`;
 }
 
 function topologyTDropNote(
@@ -2414,7 +2417,7 @@ function topologyBiasNote(
   const t = report.robust?.[kind]?.t_drop;
   const tBit = t != null ? ` T_drop is ${fmt(t, 3)}.` : "";
   if (kind === "dilated") {
-    return `η = ${fmt(eta, 2)} grows silicon (over-dose / under-etch). Same filtered density as the intended layout; only the threshold changes. This is one of the three blueprints in the worst-case loop, not a SEM litho model.${tBit}`;
+    return `η = ${fmt(eta, 2)} grows silicon (over-dose / under-etch). Same filtered density as the intended layout; only the threshold changes. This is one of the three blueprints differentiated in the loop, not a SEM litho model.${tBit}`;
   }
   return `η = ${fmt(eta, 2)} shrinks silicon (under-dose / over-etch). Same filtered density, higher threshold. The optimizer scores this split every step with the other two.${tBit}`;
 }
@@ -2441,10 +2444,10 @@ function TopologyPanel({
     <>
       <p className="muted">
         Density TO of the coupler: Helmholtz filter and tanh projection for DUV min
-        feature size. Each step uses the worst κ error of dilated / intermediate /
-        eroded (η = {fmt(etas.dilated, 2)} / {fmt(etas.intermediate, 2)} /{" "}
-        {fmt(etas.eroded, 2)}; Piggott / Wang), then litho/etch bias and GDS. Same 2.5D
-        strip as FDTD — not a 3D ring solve.
+        feature size. Each step sums the κ error of dilated / intermediate / eroded
+        (η = {fmt(etas.dilated, 2)} / {fmt(etas.intermediate, 2)} / {fmt(etas.eroded, 2)};
+        Piggott / Wang), including litho/etch bias, then writes GDS. Same 2.5D strip as
+        FDTD — not a 3D ring solve.
       </p>
       <div className="spectrum-toolbar" style={{ justifyContent: "flex-start", gap: 8 }}>
         <button type="button" onClick={() => onRun()} disabled={busy || sweepBusy}>
@@ -2491,13 +2494,19 @@ function TopologyPanel({
               <div className="metrics">
                 <Metric label="P_heater" value={`${fmt(report.thermal.power_mw, 1)} mW`} />
                 <Metric label="ΔT max" value={`${fmt(report.thermal.dt_max_k, 1)} K`} />
+                {report.thermal.dt_ring_k != null ? (
+                  <Metric label="ΔT ring" value={`${fmt(report.thermal.dt_ring_k, 1)} K`} />
+                ) : null}
+                {report.thermal.shift_nm != null ? (
+                  <Metric label="Δλ ring" value={`${fmt(report.thermal.shift_nm, 3)} nm`} />
+                ) : null}
                 <Metric label="κ off" value={fmt(report.thermal.t_drop_off, 3)} />
                 <Metric label="κ hot" value={fmt(report.thermal.t_drop_hot, 3)} />
                 <Metric label="|Δκ|" value={fmt(report.thermal.abs_dkappa, 3)} />
               </div>
               {report.field_t ? (
                 <Heatmap
-                  title="Heater ΔT in the TO window"
+                  title="Heater ΔT on the chip"
                   xLabel="y (μm)"
                   yLabel="x (μm)"
                   field={report.field_t}
@@ -2537,13 +2546,17 @@ function TopologyPanel({
           {report.history.length > 1 ? (
             <>
               <LinePlot
-                title="Worst-case TO objective"
+                title="TO objective"
                 xLabel="Step"
-                yLabel="max (T_drop − target)²"
+                yLabel={
+                  report.thermo_optic
+                    ? "Σ (T−κ)² + drift + (Δλ)²"
+                    : "Σ (T_drop − target)²"
+                }
                 x={report.history.map((h) => h.step)}
                 series={[
                   {
-                    name: "worst κ error",
+                    name: "objective",
                     y: report.history.map((h) => h.objective),
                     kind: "through",
                   },
@@ -2605,7 +2618,7 @@ function TopologyPanel({
                     },
                   ]}
                   xDigits={0}
-                  note="Same intermediate blueprint at heater-off and heater-on ε(T). The adjoint used whichever dilated/eroded × off/on corner was worst that step."
+                  note="Same intermediate blueprint at heater-off and heater-on. Temperature is sampled from the chip-scale heat solve. The update differentiates every blueprint at both temperatures, the drift, and the ring resonance shift."
                   noteLabel="Thermo-optic"
                 />
               ) : null}
