@@ -619,8 +619,24 @@ button:focus-visible {
   max-height: min(560px, 72vh);
 }
 
+.board-pane {
+  flex: 1 1 0;
+  align-self: stretch;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  min-height: 0;
+}
+
+.board-pane.is-dormant {
+  display: none;
+}
+
 .iso-webgl-stage {
-  width: min(920px, 94%);
+  width: min(920px, 100%);
+  max-width: 100%;
+  box-sizing: border-box;
 }
 
 .iso-webgl-host {
@@ -632,6 +648,38 @@ button:focus-visible {
   background: var(--surface);
   border: 1px solid var(--glass-line);
   box-shadow: var(--shadow-chip);
+}
+
+.iso-webgl-toolbar {
+  position: absolute;
+  right: 10px;
+  top: 10px;
+  z-index: 2;
+  display: flex;
+  gap: 6px;
+}
+
+.iso-webgl-toolbar button {
+  padding: 5px 10px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--ink-2);
+  background: var(--glass-strong);
+  border: 1px solid var(--glass-line);
+  border-radius: 999px;
+  box-shadow: var(--glass-inset);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+}
+
+.iso-webgl-toolbar button:hover:not(:disabled) {
+  color: var(--ink);
+  border-color: var(--accent-line);
+}
+
+.iso-webgl-toolbar button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 .iso-webgl-host canvas {
@@ -737,7 +785,8 @@ button:focus-visible {
 
 .circuit-svg .seg.selected .device-line,
 .circuit-svg .seg.selected .bus,
-.circuit-svg .seg.selected .detector {
+.circuit-svg .seg.selected .detector,
+.circuit-svg .seg.selected .heater {
   stroke: var(--accent);
   stroke-width: 3;
 }
@@ -752,6 +801,40 @@ button:focus-visible {
   fill: #ecece6;
   stroke: var(--ink);
   stroke-width: 2;
+}
+
+.circuit-svg .heater {
+  fill: none;
+  stroke: #c4a35a;
+  stroke-width: 4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.circuit-svg rect.heater {
+  fill: #d4b06a;
+  stroke: #8a7028;
+  stroke-width: 1.6;
+}
+
+.circuit-svg .heater-hit {
+  fill: none;
+  stroke: transparent;
+  stroke-width: 16;
+  stroke-linecap: round;
+}
+
+.circuit-svg path.halo {
+  fill: none;
+  stroke-width: 6;
+}
+
+.circuit-svg .seg.selected .heater {
+  stroke: var(--accent);
+}
+
+.circuit-svg .seg.selected rect.heater {
+  fill: #e4c888;
 }
 
 .circuit-svg .seg.selected .detector {
@@ -1250,11 +1333,34 @@ label {
   background: var(--accent);
 }
 
+.spectrum-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  margin: 0 0 10px;
+}
+
 .plot line.guide {
   stroke: var(--accent);
   stroke-dasharray: 3 3;
   stroke-width: 1;
   opacity: 0.7;
+}
+
+.plot line.guide.res {
+  stroke: var(--ink);
+  stroke-dasharray: 2 3;
+  opacity: 0.55;
+}
+
+.plot line.guide.fwhm {
+  stroke: var(--muted);
+  stroke-dasharray: 1 3;
+  opacity: 0.5;
+}
+
+.plot text.mark-label {
+  font-size: 10px;
+  fill: var(--muted);
 }
 
 .schematic .box {

@@ -8,6 +8,7 @@ import unittest
 from circuit import analyze_circuit
 from coupler import analyze_coupler
 from ring import kappa_for_critical, radius_for_laser
+from sparams import power_db, scale_spectrum_power
 from theory import circuit_theory
 from waveguide import analyze_waveguide
 
@@ -347,6 +348,54 @@ class TheoryChecksTest(unittest.TestCase):
         self.assertGreater(tiny["critical"]["kappa"], large["critical"]["kappa"])
         self.assertTrue(_by_id(tiny["theory"])["resonance"]["ok"])
         self.assertTrue(_by_id(large["theory"])["resonance"]["ok"])
+
+    def test_spectrum_power_scale_updates_linear_and_db(self):
+        spec = {
+            "wavelength_nm": [1550.0, 1551.0],
+            "through": [1.0, 0.25],
+            "t_through": [1.0, 0.25],
+            "drop": [0.0, 0.5],
+            "t_drop": [0.0, 0.5],
+            "s21_db": [0.0, -6.020599913279624],
+            "s31_db": [-180.0, -3.010299956639812],
+        }
+        out = scale_spectrum_power(spec, 0.5)
+        self.assertAlmostEqual(out["through"][0], 0.5)
+        self.assertAlmostEqual(out["t_through"][1], 0.125)
+        self.assertAlmostEqual(out["drop"][1], 0.25)
+        self.assertAlmostEqual(out["s21_db"][0], power_db(0.5), places=6)
+        self.assertAlmostEqual(out["s21_db"][1], power_db(0.125), places=5)
+        self.assertIs(scale_spectrum_power(spec, 1.0), spec)
+        self.assertIsNone(scale_spectrum_power(None, 0.5))
+
+    def test_circuit_spectrum_includes_db_and_tracks_waveguide_loss(self):
+        result = _starter("all-pass")
+        spec = result["spectrum"]
+        self.assertGreater(len(spec["wavelength_nm"]), 10)
+        self.assertEqual(len(spec["through"]), len(spec["s21_db"]))
+        i0 = min(range(len(spec["wavelength_nm"])), key=lambda i: spec["through"][i])
+        self.assertAlmostEqual(spec["s21_db"][i0], power_db(spec["through"][i0]), places=4)
+        lossy = _circuit("all-pass")
+        # Extra bus length only changes the constant T scale, not λ₀.
+        longer = analyze_circuit(
+            width_nm=450.0,
+            height_nm=220.0,
+            wavelength_nm=1550.0,
+            n_clad=1.33,
+            polarization="TE",
+            devices=[
+                {"type": "waveguide", "length_um": 2000.0},
+                {"type": "coupler", "gap_nm": 200.0, "length_um": 12.0},
+                {"type": "ring", "radius_um": 10.0, "config": "all-pass"},
+            ],
+        )
+        self.assertLess(min(longer["spectrum"]["through"]), min(lossy["spectrum"]["through"]))
+        self.assertAlmostEqual(
+            longer["spectrum"]["s21_db"][0] - power_db(longer["spectrum"]["through"][0]),
+            0.0,
+            places=4,
+        )
+        self.assertAlmostEqual(longer["resonance_nm"], lossy["resonance_nm"], places=4)
 
     def test_air_cladding_still_matches_resonance_and_fsr(self):
         result = _circuit("all-pass", n_clad=1.0)

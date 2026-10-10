@@ -4,7 +4,7 @@ import { Chip3D } from "./Chip3D";
 type RingConfig = "all-pass" | "add-drop";
 type Polarization = "TE" | "TM";
 type BoardView = "top" | "section" | "iso";
-type DeviceType = "ring" | "waveguide" | "coupler" | "detector";
+type DeviceType = "ring" | "waveguide" | "coupler" | "detector" | "heater";
 
 type Platform = {
   wavelength_nm: number;
@@ -52,7 +52,17 @@ type DetectorDevice = {
   load_ohm: number;
 };
 
-type PlacedDevice = RingDevice | WaveguideDevice | CouplerDevice | DetectorDevice;
+type HeaterDevice = {
+  id: string;
+  type: "heater";
+  x: number;
+  y: number;
+  power_mw: number;
+  width_um: number;
+  length_um: number;
+};
+
+type PlacedDevice = RingDevice | WaveguideDevice | CouplerDevice | DetectorDevice | HeaterDevice;
 
 type FieldMap = {
   x_nm?: number[];
@@ -122,10 +132,59 @@ type CouplerResult = {
   field?: FieldMap;
 };
 
+type ThermalCorners = {
+  source: string;
+  dn_eff_dt: number;
+  dlambda_dt_nm_per_k: number;
+  t_ref_c: number;
+  corners_k: number[];
+  points: {
+    delta_t_k: number;
+    n_eff: number;
+    kappa: number;
+    resonance_nm: number;
+    shift_nm: number;
+    t_through: number;
+    t_drop: number | null;
+    abs_dkappa: number;
+    abs_dlambda_nm: number;
+  }[];
+  worst_kappa: { delta_t_k: number; kappa: number; abs_dkappa: number } | null;
+  worst_lambda: { delta_t_k: number; shift_nm: number; abs_dlambda_nm: number } | null;
+  heater?: {
+    source: string;
+    layout: { x0: number; y0: number; width: number; height: number; power_mw: number }[];
+    power_mw: number;
+    dt_max_k: number;
+    dt_ring_k: number;
+    dt_coupler_k: number;
+    field: FieldMap;
+    note: string;
+    points: {
+      scale: number;
+      power_mw: number;
+      dt_ring_k: number;
+      dt_coupler_k: number;
+      n_eff: number;
+      kappa: number;
+      resonance_nm: number;
+      shift_nm: number;
+      t_through: number | null;
+      t_drop: number | null;
+      abs_dkappa: number;
+      abs_dlambda_nm: number;
+    }[];
+    worst_kappa: { power_mw: number; kappa: number; abs_dkappa: number };
+    worst_lambda: { power_mw: number; shift_nm: number; abs_dlambda_nm: number };
+  } | null;
+  note: string;
+};
+
 type ModeResult = {
   n_eff: number;
   n_g: number;
   dn_eff_dn: number;
+  dn_eff_dt?: number;
   loss_db_per_cm: number;
   gamma_core: number;
   gamma_clad: number;
@@ -191,6 +250,7 @@ type CircuitResult = {
   detectors?: (DetectorResult & { port: string; optical_power_uw: number })[];
   radius_for_laser_um?: number | null;
   analyte_sweep?: AnalyteSweep | null;
+  thermal_corners?: ThermalCorners | null;
   critical?: CriticalCoupling | null;
   theory?: TheoryReport | null;
   fdtd?: FdtdReport | null;
@@ -250,9 +310,16 @@ type TopologyResult = {
     t_drop: number;
     beta: number;
     worst?: "dilated" | "intermediate" | "eroded";
+    thermal?: "off" | "hot";
+    drift?: number;
+    shift_nm?: number;
+    dt_ring_k?: number;
+    gradient?: "optical" | "optical+heat";
     t_drop_dilated?: number;
     t_drop_intermediate?: number;
     t_drop_eroded?: number;
+    t_drop_off?: number;
+    t_drop_hot?: number;
   }[];
   robust?: {
     dilated?: { t_through: number; t_drop: number };
@@ -269,6 +336,53 @@ type TopologyResult = {
   field_dilated?: FieldMap;
   field_eroded?: FieldMap;
   field_ez?: FieldMap;
+  eta_curve?: EtaCurve | null;
+  thermo_optic?: boolean;
+  thermal?: {
+    source: string;
+    power_mw: number;
+    dt_max_k: number;
+    dt_ring_k?: number | null;
+    shift_nm?: number | null;
+    t_drop_off: number | null;
+    t_drop_hot: number | null;
+    abs_dkappa: number | null;
+    kappa_target: number;
+    note: string;
+  } | null;
+  field_t?: FieldMap | null;
+};
+
+type EtaCurve = {
+  points: { eta: number; t_through: number; t_drop: number; abs_dkappa: number }[];
+  worst_eta: number | null;
+  worst_abs_dkappa: number | null;
+  spread: number;
+};
+
+type TopologySweepRow = {
+  mfs_nm: number;
+  filter_radius_nm: number;
+  mode: "robust" | "intermediate";
+  t_drop: number | null;
+  worst?: "dilated" | "intermediate" | "eroded" | null;
+  t_drop_worst?: number | null;
+  worst_abs_dkappa: number | null;
+  dilated?: { t_through: number; t_drop: number } | null;
+  intermediate?: { t_through: number; t_drop: number } | null;
+  eroded?: { t_through: number; t_drop: number } | null;
+};
+
+type TopologySweep = {
+  kind: string;
+  kappa_target: number;
+  steps: number;
+  mfs_nm: number[];
+  modes: string[];
+  rows: TopologySweepRow[];
+  eta_curve?: EtaCurve | null;
+  note: string;
+  error?: string;
 };
 
 type CriticalCoupling = {
@@ -333,7 +447,9 @@ const library: { type: DeviceType; label: string }[] = [
   { type: "coupler", label: "Coupler" },
   { type: "ring", label: "Ring resonator" },
   { type: "detector", label: "Detector" },
+  { type: "heater", label: "Heater" },
 ];
+
 
 function DeviceIcon({ type }: { type: DeviceType }) {
   return (
@@ -358,6 +474,11 @@ function DeviceIcon({ type }: { type: DeviceType }) {
         <svg viewBox="0 0 16 16">
           <polygon points="3,3 13,8 3,13" />
           <line x1="13" y1="4" x2="13" y2="12" />
+        </svg>
+      ) : null}
+      {type === "heater" ? (
+        <svg viewBox="0 0 16 16">
+          <rect x="3" y="5" width="10" height="6" rx="1" />
         </svg>
       ) : null}
     </span>
@@ -409,6 +530,7 @@ function arrange(devices: PlacedDevice[]): PlacedDevice[] {
   const buses = waveguides(devices);
   const couplers = devices.filter((d): d is CouplerDevice => d.type === "coupler");
   const dets = devices.filter((d): d is DetectorDevice => d.type === "detector");
+  const heaters = devices.filter((d): d is HeaterDevice => d.type === "heater");
   const addDrop = rings.some((r) => r.config === "add-drop");
   const pos = new Map<string, { x: number; y: number }>();
 
@@ -453,6 +575,20 @@ function arrange(devices: PlacedDevice[]): PlacedDevice[] {
     pos.set(d.id, clampChip(bp.x + wgHalf(bus.length_um) + 18, bp.y));
   });
 
+  heaters.forEach((h, i) => {
+    const ring = rings[0];
+    if (ring) {
+      const rp = pos.get(ring.id)!;
+      const r = ringPx(ring.radius_um);
+      const ang = i === 0 ? -Math.PI / 2 : Math.PI / 2;
+      pos.set(h.id, clampChip(rp.x + r * Math.cos(ang), rp.y + r * Math.sin(ang)));
+      return;
+    }
+    const bus = buses[0];
+    const bp = bus ? pos.get(bus.id)! : { x: BUS_X, y: THROUGH_Y };
+    pos.set(h.id, clampChip(bp.x, bp.y - 12));
+  });
+
   return devices.map((d) => {
     const p = pos.get(d.id);
     return p ? ({ ...d, ...p } as PlacedDevice) : d;
@@ -462,7 +598,7 @@ function arrange(devices: PlacedDevice[]): PlacedDevice[] {
 function withPrereqs(existing: PlacedDevice[], type: DeviceType) {
   const next = [...existing];
   if (
-    (type === "ring" || type === "coupler" || type === "detector") &&
+    (type === "ring" || type === "coupler" || type === "detector" || type === "heater") &&
     !waveguides(next).length
   ) {
     next.push(createDevice("waveguide", next));
@@ -499,6 +635,13 @@ function place(type: DeviceType, existing: PlacedDevice[]) {
   if (type === "ring") {
     return { x: bus?.x ?? 250, y: (bus?.y ?? THROUGH_Y) - 76 };
   }
+  if (type === "heater") {
+    if (ring) {
+      const r = ringPx(ring.radius_um);
+      return { x: ring.x, y: ring.y - r };
+    }
+    return { x: bus?.x ?? BUS_X, y: (bus?.y ?? THROUGH_Y) - 12 };
+  }
   return { x: (bus?.x ?? BUS_X) + 170, y: bus?.y ?? THROUGH_Y };
 }
 
@@ -519,6 +662,39 @@ function nearestRing(x: number, y: number, devices: PlacedDevice[]) {
     const dR = (r.x - x) ** 2 + (r.y - y) ** 2;
     return dR < dBest ? r : best;
   });
+}
+
+function heaterMark(d: HeaterDevice, devices: PlacedDevice[]) {
+  // Arc follows the ring so the gold outline sits on the Si, not a floating box.
+  const ring = nearestRing(d.x, d.y, devices);
+  if (ring) {
+    const r = ringPx(ring.radius_um);
+    const mid = Math.atan2(d.y - ring.y, d.x - ring.x);
+    const half = Math.min(2.35, Math.max(1.7, d.length_um / Math.max(ring.radius_um, 8)));
+    const a0 = mid - half;
+    const a1 = mid + half;
+    const large = half > Math.PI / 2 ? 1 : 0;
+    const x0 = ring.x + r * Math.cos(a0);
+    const y0 = ring.y + r * Math.sin(a0);
+    const x1 = ring.x + r * Math.cos(a1);
+    const y1 = ring.y + r * Math.sin(a1);
+    return {
+      kind: "arc" as const,
+      path: `M ${x0} ${y0} A ${r} ${r} 0 ${large} 1 ${x1} ${y1}`,
+      labelX: ring.x + (r + 13) * Math.cos(mid),
+      labelY: ring.y + (r + 13) * Math.sin(mid),
+    };
+  }
+  const half = Math.max(18, Math.min(40, d.length_um * 0.7));
+  return {
+    kind: "bar" as const,
+    x: d.x - half,
+    y: d.y - 3,
+    w: half * 2,
+    h: 6,
+    labelX: d.x,
+    labelY: d.y + 16,
+  };
 }
 
 function snapPos(
@@ -548,6 +724,16 @@ function snapPos(
       if (Math.abs(yy - bus.y) < 40) yy = yy >= bus.y ? bus.y + 48 : bus.y - 48;
     }
     return { x: aligned, y: yy };
+  }
+  if (type === "heater") {
+    const ring = others.find((d): d is RingDevice => d.type === "ring");
+    if (ring) {
+      const r = ringPx(ring.radius_um);
+      const ang = Math.atan2(y - ring.y, x - ring.x);
+      return { x: ring.x + r * Math.cos(ang), y: ring.y + r * Math.sin(ang) };
+    }
+    const bus = buses[0];
+    return { x, y: bus ? bus.y - 12 : y };
   }
   if (type === "coupler" || type === "detector") {
     let best: WaveguideDevice | null = null;
@@ -580,6 +766,9 @@ function createDevice(type: DeviceType, existing: PlacedDevice[]): PlacedDevice 
   if (type === "waveguide") return { id: uid("wg"), type, ...p, length_um: 180 };
   if (type === "coupler") return { id: uid("cpl"), type, ...p, gap_nm: 200, length_um: 12 };
   if (type === "ring") return { id: uid("ring"), type, ...p, radius_um: 10, config: "all-pass" };
+  if (type === "heater") {
+    return { id: uid("ht"), type, ...p, power_mw: 10, width_um: 2, length_um: 40 };
+  }
   return {
     id: uid("pd"),
     type: "detector",
@@ -596,6 +785,7 @@ function labelOf(d: PlacedDevice) {
   if (d.type === "waveguide") return "Waveguide";
   if (d.type === "coupler") return "Coupler";
   if (d.type === "ring") return "Ring";
+  if (d.type === "heater") return "Heater";
   return "Detector";
 }
 
@@ -617,6 +807,7 @@ export default function App() {
   const [solveStatus, setSolveStatus] = useState<"solving" | "ready" | "error">("solving");
   const [grid, setGrid] = useState(true);
   const [view, setView] = useState<BoardView>("top");
+  const [isoMounted, setIsoMounted] = useState(false);
   const [libraryOpen, setLibraryOpen] = useState(true);
   const [propertiesOpen, setPropertiesOpen] = useState(true);
   const [resultsOpen, setResultsOpen] = useState(true);
@@ -624,8 +815,14 @@ export default function App() {
   const [fdtdBusy, setFdtdBusy] = useState(false);
   const [topologyRun, setTopologyRun] = useState<TopologyResult | null>(null);
   const [topologyBusy, setTopologyBusy] = useState(false);
+  const [topologySweep, setTopologySweep] = useState<TopologySweep | null>(null);
+  const [topologySweepBusy, setTopologySweepBusy] = useState(false);
 
   const selected = devices.find((d) => d.id === selectedId) ?? null;
+
+  useEffect(() => {
+    if (view === "iso") setIsoMounted(true);
+  }, [view]);
 
   function setPlatformField<K extends keyof Platform>(name: K, value: Platform[K]) {
     setPlatform((prev) => ({ ...prev, [name]: value }));
@@ -703,7 +900,7 @@ export default function App() {
     );
   }
 
-  async function runTopology() {
+  async function runTopology(thermoOptic = false) {
     setTopologyBusy(true);
     try {
       const pin = devices.find((d): d is DetectorDevice => d.type === "detector");
@@ -715,6 +912,7 @@ export default function App() {
           devices,
           input_power_uw: pin?.optical_power_uw ?? 10,
           kappa_target: circuit?.critical?.kappa ?? circuit?.kappa ?? undefined,
+          thermo_optic: thermoOptic,
         }),
       });
       if (!res.ok) {
@@ -726,6 +924,33 @@ export default function App() {
       setError("Could not reach the Python backend. Start it on port 8000.");
     } finally {
       setTopologyBusy(false);
+    }
+  }
+
+  async function runTopologySweep() {
+    setTopologySweepBusy(true);
+    try {
+      const pin = devices.find((d): d is DetectorDevice => d.type === "detector");
+      const res = await fetch("/api/topology/sweep", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ...platform,
+          devices,
+          input_power_uw: pin?.optical_power_uw ?? 10,
+          steps: 4,
+          kappa_target: circuit?.critical?.kappa ?? circuit?.kappa ?? undefined,
+        }),
+      });
+      if (!res.ok) {
+        setError("Robustness sweep failed.");
+        return;
+      }
+      setTopologySweep((await res.json()) as TopologySweep);
+    } catch {
+      setError("Could not reach the Python backend. Start it on port 8000.");
+    } finally {
+      setTopologySweepBusy(false);
     }
   }
 
@@ -1102,6 +1327,38 @@ export default function App() {
                     ) : null}
                   </>
                 ) : null}
+                {selected.type === "heater" ? (
+                  <>
+                    <p className="muted">
+                      TiN-style resistor. Power dumps into a 2D BOX-sink heat solve;
+                      ring and coupler can see different ΔT.
+                    </p>
+                    <Field
+                      label="Power (mW)"
+                      value={selected.power_mw}
+                      onChange={(v) => patchSelected({ power_mw: v })}
+                      step="1"
+                      min={0}
+                      max={80}
+                    />
+                    <Field
+                      label="Width (μm)"
+                      value={selected.width_um}
+                      onChange={(v) => patchSelected({ width_um: v })}
+                      step="0.2"
+                      min={0.4}
+                      max={8}
+                    />
+                    <Field
+                      label="Length (μm)"
+                      value={selected.length_um}
+                      onChange={(v) => patchSelected({ length_um: v })}
+                      step="1"
+                      min={2}
+                      max={120}
+                    />
+                  </>
+                ) : null}
                 {selected.type === "detector" ? (
                   <>
                     <Field
@@ -1162,17 +1419,8 @@ export default function App() {
               onWidthChange={(v) => setPlatformField("width_nm", v)}
               onHeightChange={(v) => setPlatformField("height_nm", v)}
             />
-          ) : view === "iso" ? (
-            <Chip3D
-              devices={devices}
-              selectedId={selectedId}
-              widthNm={platform.width_nm}
-              heightNm={platform.height_nm}
-              nClad={platform.n_clad}
-              onSelect={setSelectedId}
-              onPlaceSensor={placeSensor}
-            />
-          ) : (
+          ) : null}
+          {view === "top" ? (
             <CircuitBoard
               devices={devices}
               selectedId={selectedId}
@@ -1181,7 +1429,24 @@ export default function App() {
               onPatch={patchDevice}
               onPlaceSensor={placeSensor}
             />
-          )}
+          ) : null}
+          {isoMounted ? (
+            <div
+              className={view === "iso" ? "board-pane" : "board-pane is-dormant"}
+              aria-hidden={view !== "iso"}
+            >
+              <Chip3D
+                devices={devices}
+                selectedId={selectedId}
+                widthNm={platform.width_nm}
+                heightNm={platform.height_nm}
+                nClad={platform.n_clad}
+                active={view === "iso"}
+                onSelect={setSelectedId}
+                onPlaceSensor={placeSensor}
+              />
+            </div>
+          ) : null}
         </main>
 
         <Bar
@@ -1215,6 +1480,9 @@ export default function App() {
                   value={circuit.kappa != null ? fmt(circuit.kappa, 3) : "—"}
                 />
               </div>
+              {circuit.spectrum?.wavelength_nm?.length ? (
+                <SpectrumPanel circuit={circuit} laserNm={platform.wavelength_nm} />
+              ) : null}
               <ResultFold title="Design" defaultOpen>
                 <div className="metrics">
                   <Metric label="Devices" value={circuit.device_count} />
@@ -1271,34 +1539,6 @@ export default function App() {
                   </div>
                 </ResultFold>
               ) : null}
-              {circuit.spectrum?.wavelength_nm?.length ? (
-                <ResultFold title="Spectrum">
-                  <LinePlot
-                    title="S-parameters"
-                    xLabel="Wavelength (nm)"
-                    yLabel="|S| (dB)"
-                    x={circuit.spectrum.wavelength_nm}
-                    series={[
-                      {
-                        name: "|S21| through",
-                        y: circuit.spectrum.through,
-                        kind: "through",
-                      },
-                      ...(circuit.spectrum.drop
-                        ? [
-                            {
-                              name: "|S31| drop",
-                              y: circuit.spectrum.drop,
-                              kind: "drop" as const,
-                            },
-                          ]
-                        : []),
-                    ]}
-                    db
-                    markX={platform.wavelength_nm}
-                  />
-                </ResultFold>
-              ) : null}
               {circuit.analyte_sweep?.n_clad?.length ? (
                 <ResultFold title="Analyte sweep">
                   <div className="metrics">
@@ -1349,6 +1589,142 @@ export default function App() {
                   />
                 </ResultFold>
               ) : null}
+              {circuit.thermal_corners?.points?.length || circuit.thermal_corners?.heater ? (
+                <ResultFold title="Thermal corners" defaultOpen>
+                  <div className="metrics">
+                    <Metric
+                      label="dn_eff/dT"
+                      value={`${fmt(circuit.thermal_corners.dn_eff_dt * 1e4, 2)}×10⁻⁴ /K`}
+                    />
+                    <Metric
+                      label="dλ/dT"
+                      value={`${fmt(circuit.thermal_corners.dlambda_dt_nm_per_k, 3)} nm/K`}
+                    />
+                    {circuit.thermal_corners.worst_lambda ? (
+                      <Metric
+                        label="Worst |Δλ|"
+                        value={`${fmt(circuit.thermal_corners.worst_lambda.abs_dlambda_nm, 3)} nm @ ${fmt(circuit.thermal_corners.worst_lambda.delta_t_k, 0)} K`}
+                      />
+                    ) : null}
+                    {circuit.thermal_corners.worst_kappa ? (
+                      <Metric
+                        label="Worst |Δκ|"
+                        value={`${fmt(circuit.thermal_corners.worst_kappa.abs_dkappa, 3)} @ ${fmt(circuit.thermal_corners.worst_kappa.delta_t_k, 0)} K`}
+                      />
+                    ) : null}
+                  </div>
+                  {circuit.thermal_corners.points.length ? (
+                    <>
+                      <LinePlot
+                        title="Resonance vs ΔT"
+                        xLabel="ΔT (K)"
+                        yLabel="Δλ (nm)"
+                        x={circuit.thermal_corners.points.map((p) => p.delta_t_k)}
+                        series={[
+                          {
+                            name: "λ0 − λ0(20 °C)",
+                            y: circuit.thermal_corners.points.map((p) => p.shift_nm),
+                            kind: "through",
+                          },
+                        ]}
+                        markX={0}
+                        xDigits={0}
+                        yAuto
+                        note={circuit.thermal_corners.note}
+                        noteLabel="Thermal"
+                      />
+                      <LinePlot
+                        title="Coupler κ vs ΔT"
+                        xLabel="ΔT (K)"
+                        yLabel="κ"
+                        x={circuit.thermal_corners.points.map((p) => p.delta_t_k)}
+                        series={[
+                          {
+                            name: "κ(ΔT)",
+                            y: circuit.thermal_corners.points.map((p) => p.kappa),
+                            kind: "drop",
+                          },
+                        ]}
+                        markX={0}
+                        xDigits={0}
+                        yAuto
+                        note={
+                          circuit.thermal_corners.worst_kappa
+                            ? `Worst |Δκ| is ${fmt(circuit.thermal_corners.worst_kappa.abs_dkappa, 3)} at ΔT = ${fmt(circuit.thermal_corners.worst_kappa.delta_t_k, 0)} K (κ = ${fmt(circuit.thermal_corners.worst_kappa.kappa, 3)}). Same idea as dilated/eroded: score the worst corner, not only 20 °C.`
+                            : circuit.thermal_corners.note
+                        }
+                        noteLabel="κ corners"
+                      />
+                    </>
+                  ) : null}
+                  {circuit.thermal_corners.heater ? (
+                    <>
+                      <div className="metrics">
+                        <Metric
+                          label="P_heater"
+                          value={`${fmt(circuit.thermal_corners.heater.power_mw, 1)} mW`}
+                        />
+                        <Metric
+                          label="ΔT max"
+                          value={`${fmt(circuit.thermal_corners.heater.dt_max_k, 1)} K`}
+                        />
+                        <Metric
+                          label="ΔT ring"
+                          value={`${fmt(circuit.thermal_corners.heater.dt_ring_k, 1)} K`}
+                        />
+                        <Metric
+                          label="ΔT coupler"
+                          value={`${fmt(circuit.thermal_corners.heater.dt_coupler_k, 1)} K`}
+                        />
+                      </div>
+                      {circuit.thermal_corners.heater.field ? (
+                        <Heatmap
+                          title="Heater ΔT"
+                          xLabel="y (μm)"
+                          yLabel="x (μm)"
+                          field={circuit.thermal_corners.heater.field}
+                          note={`${circuit.thermal_corners.heater.note} Color is ΔT / ${fmt(circuit.thermal_corners.heater.dt_max_k, 1)} K.`}
+                          noteLabel="Heat"
+                        />
+                      ) : null}
+                      <LinePlot
+                        title="Resonance vs heater power"
+                        xLabel="P (mW)"
+                        yLabel="Δλ (nm)"
+                        x={circuit.thermal_corners.heater.points.map((p) => p.power_mw)}
+                        series={[
+                          {
+                            name: "λ0 − λ0(off)",
+                            y: circuit.thermal_corners.heater.points.map((p) => p.shift_nm),
+                            kind: "through",
+                          },
+                        ]}
+                        xDigits={1}
+                        yAuto
+                        note={`At ${fmt(circuit.thermal_corners.heater.power_mw, 1)} mW the ring sees ${fmt(circuit.thermal_corners.heater.dt_ring_k, 1)} K and the coupler ${fmt(circuit.thermal_corners.heater.dt_coupler_k, 1)} K. Worst |Δλ| is ${fmt(circuit.thermal_corners.heater.worst_lambda.abs_dlambda_nm, 3)} nm.`}
+                        noteLabel="Heater λ"
+                      />
+                      <LinePlot
+                        title="Coupler κ vs heater power"
+                        xLabel="P (mW)"
+                        yLabel="κ"
+                        x={circuit.thermal_corners.heater.points.map((p) => p.power_mw)}
+                        series={[
+                          {
+                            name: "κ(P)",
+                            y: circuit.thermal_corners.heater.points.map((p) => p.kappa),
+                            kind: "drop",
+                          },
+                        ]}
+                        xDigits={1}
+                        yAuto
+                        note={`Worst |Δκ| is ${fmt(circuit.thermal_corners.heater.worst_kappa.abs_dkappa, 3)} at ${fmt(circuit.thermal_corners.heater.worst_kappa.power_mw, 1)} mW.`}
+                        noteLabel="Heater κ"
+                      />
+                    </>
+                  ) : null}
+                </ResultFold>
+              ) : null}
               {circuit.detectors?.length ? (
                 <ResultFold title="Detectors" defaultOpen>
                   {circuit.detectors.map((d, i) => (
@@ -1386,6 +1762,10 @@ export default function App() {
                   report={topologyRun}
                   busy={topologyBusy}
                   onRun={runTopology}
+                  onThermoRun={() => runTopology(true)}
+                  sweep={topologySweep}
+                  sweepBusy={topologySweepBusy}
+                  onSweep={runTopologySweep}
                 />
               </ResultFold>
             </>
@@ -1571,6 +1951,42 @@ function CircuitBoard({
                 </>
               ) : null}
 
+              {d.type === "heater" ? (
+                <>
+                  {(() => {
+                    const mark = heaterMark(d, devices);
+                    return mark.kind === "arc" ? (
+                      <>
+                        {selected ? <path className="halo" d={mark.path} /> : null}
+                        <path className="heater-hit" d={mark.path} />
+                        <path className="heater" d={mark.path} />
+                        <text className="caption" x={mark.labelX} y={mark.labelY} textAnchor="middle">
+                          heater
+                        </text>
+                      </>
+                    ) : (
+                      <>
+                        {selected ? (
+                          <rect
+                            className="halo"
+                            x={mark.x - 6}
+                            y={mark.y - 6}
+                            width={mark.w + 12}
+                            height={mark.h + 12}
+                            rx={4}
+                          />
+                        ) : null}
+                        <rect className="hit-fill" x={mark.x} y={mark.y} width={mark.w} height={mark.h} />
+                        <rect className="heater" x={mark.x} y={mark.y} width={mark.w} height={mark.h} rx={2} />
+                        <text className="caption" x={mark.labelX} y={mark.labelY} textAnchor="middle">
+                          heater
+                        </text>
+                      </>
+                    );
+                  })()}
+                </>
+              ) : null}
+
               {d.type === "detector" ? (
                 <>
                   {selected ? (
@@ -1749,6 +2165,93 @@ function Bar({
   );
 }
 
+function SpectrumPanel({ circuit, laserNm }: { circuit: CircuitResult; laserNm: number }) {
+  const [unit, setUnit] = useState<"db" | "lin">("db");
+  const spec = circuit.spectrum;
+  if (!spec?.wavelength_nm?.length || !spec.through?.length) return null;
+  const extracted = circuit.extracted;
+  const lam0 = extracted?.resonance_nm ?? circuit.resonance_nm;
+  const fwhm = extracted?.fwhm_nm ?? circuit.fwhm_nm;
+  const er = extracted?.extinction_db ?? circuit.extinction_db;
+  const fsr = extracted?.fsr_nm ?? circuit.fsr_nm;
+  const drop = spec.t_drop ?? spec.drop;
+  const throughLin = spec.t_through ?? spec.through;
+  const useDb = unit === "db";
+  const throughY =
+    useDb && spec.s21_db?.length === spec.wavelength_nm.length ? spec.s21_db : throughLin;
+  const dropY =
+    drop && useDb && spec.s31_db?.length === spec.wavelength_nm.length ? spec.s31_db : drop;
+  const marks: PlotMark[] = [{ x: laserNm, label: "λ", kind: "laser" }];
+  if (lam0 != null) marks.push({ x: lam0, label: "λ0", kind: "res" });
+  if (lam0 != null && fwhm != null && fwhm > 0) {
+    marks.push({ x: lam0 - fwhm / 2, label: "−½", kind: "fwhm" });
+    marks.push({ x: lam0 + fwhm / 2, label: "+½", kind: "fwhm" });
+  }
+  const detune =
+    lam0 != null ? ` Laser is ${fmt(laserNm - lam0, 3)} nm from λ₀.` : "";
+  const note = `Through and drop are optical power vs wavelength from the compact-model ring (or coupler) sweep.${
+    fsr != null ? ` FSR is ${fmt(fsr, 3)} nm.` : ""
+  }${fwhm != null ? ` FWHM is ${fmt(fwhm, 4)} nm.` : ""}${
+    er != null ? ` Extinction is ${fmt(er, 1)} dB.` : ""
+  }${detune} Dashed guides mark the laser, resonance, and half-maximum points used for Q_loaded.`;
+
+  return (
+    <ResultFold title="Spectrum" defaultOpen>
+      <div className="spectrum-toolbar">
+        <div className="view-toggle" role="group" aria-label="Spectrum units">
+          <button
+            type="button"
+            className={useDb ? "active" : ""}
+            onClick={() => setUnit("db")}
+          >
+            dB
+          </button>
+          <button
+            type="button"
+            className={!useDb ? "active" : ""}
+            onClick={() => setUnit("lin")}
+          >
+            Linear
+          </button>
+        </div>
+      </div>
+      <div className="metrics">
+        <Metric label="λ0" value={lam0 != null ? `${fmt(lam0, 4)} nm` : "—"} />
+        <Metric label="FWHM" value={fwhm != null ? `${fmt(fwhm, 4)} nm` : "—"} />
+        <Metric label="ER" value={er != null ? `${fmt(er, 1)} dB` : "—"} />
+        <Metric label="FSR" value={fsr != null ? `${fmt(fsr, 3)} nm` : "—"} />
+      </div>
+      <LinePlot
+        title={useDb ? "Transmission" : "Transmission (linear)"}
+        xLabel="Wavelength (nm)"
+        yLabel={useDb ? "T (dB)" : "T"}
+        x={spec.wavelength_nm}
+        series={[
+          {
+            name: useDb ? "T_through (dB)" : "T_through",
+            y: throughY,
+            kind: "through",
+          },
+          ...(dropY
+            ? [
+                {
+                  name: useDb ? "T_drop (dB)" : "T_drop",
+                  y: dropY,
+                  kind: "drop" as const,
+                },
+              ]
+            : []),
+        ]}
+        db={useDb && throughY === throughLin}
+        yAuto={useDb && throughY !== throughLin}
+        marks={marks}
+        note={note}
+        noteLabel="Spectrum"
+      />
+    </ResultFold>
+  );
+}
+
 function ResultFold({
   title,
   defaultOpen = false,
@@ -1826,28 +2329,29 @@ function topologyObjectiveNote(report: TopologyResult): string {
   const ratio = end / (Math.abs(start) > 1e-12 ? start : 1e-12);
   let trend: string;
   if (end < 1e-4) {
-    trend = `ended near zero (${fmt(end, 4)}), so the worst blueprint is on the κ target`;
+    trend = `ended near zero (${fmt(end, 4)}), so the scored blueprints are on the κ target`;
   } else if (ratio < 0.7) {
-    trend = `fell from ${fmt(start, 3)} to ${fmt(end, 3)}, so the worst blueprint moved closer to the target`;
+    trend = `fell from ${fmt(start, 3)} to ${fmt(end, 3)}, so the scored blueprints moved closer to the target`;
   } else if (ratio > 1.2) {
-    trend = `rose from ${fmt(start, 3)} to ${fmt(end, 3)}; the worst-case split did not improve`;
+    trend = `rose from ${fmt(start, 3)} to ${fmt(end, 3)}; the scored splits did not improve`;
   } else {
-    trend = `stayed near ${fmt(end, 3)}; the worst-case error barely moved`;
+    trend = `stayed near ${fmt(end, 3)}; the scored error barely moved`;
   }
-  const counts = { dilated: 0, intermediate: 0, eroded: 0 };
-  for (const step of h) {
-    if (step.worst) counts[step.worst] += 1;
-  }
-  const counted = (Object.entries(counts) as [keyof typeof counts, number][]).filter(
-    ([, n]) => n > 0
-  );
-  const who =
-    counted.length > 0
-      ? ` The adjoint used ${counted.map(([name, n]) => `${name} on ${n} step${n === 1 ? "" : "s"}`).join(", ")}.`
-      : "";
   const tgt = target != null ? ` Target κ is ${fmt(target, 2)}.` : "";
-  const lastWorst = last.worst ? ` Last update was the ${last.worst} geometry.` : "";
-  return `Each point is the largest (T_drop − κ)² among dilated / intermediate / eroded, plus a small grayscale penalty on the intended layout.${tgt} The curve ${trend}.${who}${lastWorst}`;
+  const lastWorst = last.worst ? ` The farthest blueprint on the last step was the ${last.worst} geometry.` : "";
+  const hot =
+    last.t_drop_off != null && last.t_drop_hot != null
+      ? ` Last intermediate κ is ${fmt(last.t_drop_off, 3)} off and ${fmt(last.t_drop_hot, 3)} hot.`
+      : "";
+  const shift =
+    last.shift_nm != null ? ` Last ring shift is ${fmt(last.shift_nm, 3)} nm.` : "";
+  const scored = report.thermo_optic
+    ? "the sum of (T_drop − κ)² over dilated, intermediate, and eroded, each at heater off and on, plus (κ_hot − κ_off)² and the ring (Δλ)² on every blueprint"
+    : "the sum of (T_drop − κ)² over dilated, intermediate, and eroded";
+  const both = report.thermo_optic
+    ? " Heat is the chip-scale solve, sampled onto the coupler. The ring shift uses that same temperature, and both enter the heat adjoint."
+    : " Every step differentiates dilated, intermediate, and eroded.";
+  return `Each point is ${scored}, plus a small grayscale penalty on the intended layout.${tgt} The curve ${trend}.${both}${lastWorst}${hot}${shift}`;
 }
 
 function topologyTDropNote(
@@ -1913,7 +2417,7 @@ function topologyBiasNote(
   const t = report.robust?.[kind]?.t_drop;
   const tBit = t != null ? ` T_drop is ${fmt(t, 3)}.` : "";
   if (kind === "dilated") {
-    return `η = ${fmt(eta, 2)} grows silicon (over-dose / under-etch). Same filtered density as the intended layout; only the threshold changes. This is one of the three blueprints in the worst-case loop, not a SEM litho model.${tBit}`;
+    return `η = ${fmt(eta, 2)} grows silicon (over-dose / under-etch). Same filtered density as the intended layout; only the threshold changes. This is one of the three blueprints differentiated in the loop, not a SEM litho model.${tBit}`;
   }
   return `η = ${fmt(eta, 2)} shrinks silicon (under-dose / over-etch). Same filtered density, higher threshold. The optimizer scores this split every step with the other two.${tBit}`;
 }
@@ -1922,24 +2426,40 @@ function TopologyPanel({
   report,
   busy,
   onRun,
+  onThermoRun,
+  sweep,
+  sweepBusy,
+  onSweep,
 }: {
   report: TopologyResult | null;
   busy: boolean;
   onRun: () => void;
+  onThermoRun: () => void;
+  sweep: TopologySweep | null;
+  sweepBusy: boolean;
+  onSweep: () => void;
 }) {
   const etas = report?.etas ?? { dilated: 0.3, intermediate: 0.5, eroded: 0.7 };
   return (
     <>
       <p className="muted">
         Density TO of the coupler: Helmholtz filter and tanh projection for DUV min
-        feature size. Each step uses the worst κ error of dilated / intermediate /
-        eroded (η = {fmt(etas.dilated, 2)} / {fmt(etas.intermediate, 2)} /{" "}
-        {fmt(etas.eroded, 2)}; Piggott / Wang), then litho/etch bias and GDS. Same 2.5D
-        strip as FDTD — not a 3D ring solve.
+        feature size. Each step sums the κ error of dilated / intermediate / eroded
+        (η = {fmt(etas.dilated, 2)} / {fmt(etas.intermediate, 2)} / {fmt(etas.eroded, 2)};
+        Piggott / Wang), including litho/etch bias, then writes GDS. Same 2.5D strip as
+        FDTD — not a 3D ring solve.
       </p>
-      <button type="button" onClick={onRun} disabled={busy}>
-        {busy ? "Running topology…" : "Run topology"}
-      </button>
+      <div className="spectrum-toolbar" style={{ justifyContent: "flex-start", gap: 8 }}>
+        <button type="button" onClick={() => onRun()} disabled={busy || sweepBusy}>
+          {busy ? "Running topology…" : "Run topology"}
+        </button>
+        <button type="button" onClick={() => onThermoRun()} disabled={busy || sweepBusy}>
+          {busy ? "Running topology…" : "Run thermo-optic TO"}
+        </button>
+        <button type="button" onClick={onSweep} disabled={busy || sweepBusy}>
+          {sweepBusy ? "Sweeping robustness…" : "Sweep dilated / eroded"}
+        </button>
+      </div>
       {report ? (
         <>
           <div className="metrics">
@@ -1969,6 +2489,33 @@ function TopologyPanel({
             {report.filter}. {report.projection}. {report.vectorizer}.{" "}
             {report.fabrication}.
           </p>
+          {report.thermo_optic && report.thermal ? (
+            <>
+              <div className="metrics">
+                <Metric label="P_heater" value={`${fmt(report.thermal.power_mw, 1)} mW`} />
+                <Metric label="ΔT max" value={`${fmt(report.thermal.dt_max_k, 1)} K`} />
+                {report.thermal.dt_ring_k != null ? (
+                  <Metric label="ΔT ring" value={`${fmt(report.thermal.dt_ring_k, 1)} K`} />
+                ) : null}
+                {report.thermal.shift_nm != null ? (
+                  <Metric label="Δλ ring" value={`${fmt(report.thermal.shift_nm, 3)} nm`} />
+                ) : null}
+                <Metric label="κ off" value={fmt(report.thermal.t_drop_off, 3)} />
+                <Metric label="κ hot" value={fmt(report.thermal.t_drop_hot, 3)} />
+                <Metric label="|Δκ|" value={fmt(report.thermal.abs_dkappa, 3)} />
+              </div>
+              {report.field_t ? (
+                <Heatmap
+                  title="Heater ΔT on the chip"
+                  xLabel="y (μm)"
+                  yLabel="x (μm)"
+                  field={report.field_t}
+                  note={report.thermal.note}
+                  noteLabel="Thermo-optic"
+                />
+              ) : null}
+            </>
+          ) : null}
           {report.robust?.dilated || report.robust?.eroded || report.robust?.intermediate ? (
             <div className="metrics">
               {report.robust?.dilated ? (
@@ -1999,13 +2546,17 @@ function TopologyPanel({
           {report.history.length > 1 ? (
             <>
               <LinePlot
-                title="Worst-case TO objective"
+                title="TO objective"
                 xLabel="Step"
-                yLabel="max (T_drop − target)²"
+                yLabel={
+                  report.thermo_optic
+                    ? "Σ (T−κ)² + drift + (Δλ)²"
+                    : "Σ (T_drop − target)²"
+                }
                 x={report.history.map((h) => h.step)}
                 series={[
                   {
-                    name: "worst κ error",
+                    name: "objective",
                     y: report.history.map((h) => h.objective),
                     kind: "through",
                   },
@@ -2046,6 +2597,29 @@ function TopologyPanel({
                   xDigits={0}
                   note={topologyTDropNote(report, etas)}
                   noteLabel="T_drop"
+                />
+              ) : null}
+              {report.history.every((h) => h.t_drop_off != null && h.t_drop_hot != null) ? (
+                <LinePlot
+                  title="T_drop heater off / on"
+                  xLabel="Step"
+                  yLabel="T_drop"
+                  x={report.history.map((h) => h.step)}
+                  series={[
+                    {
+                      name: "off",
+                      y: report.history.map((h) => h.t_drop_off as number),
+                      kind: "through",
+                    },
+                    {
+                      name: "hot",
+                      y: report.history.map((h) => h.t_drop_hot as number),
+                      kind: "drop",
+                    },
+                  ]}
+                  xDigits={0}
+                  note="Same intermediate blueprint at heater-off and heater-on. Temperature is sampled from the chip-scale heat solve. The update differentiates every blueprint at both temperatures, the drift, and the ring resonance shift."
+                  noteLabel="Thermo-optic"
                 />
               ) : null}
             </>
@@ -2090,7 +2664,80 @@ function TopologyPanel({
               noteLabel="|Ez|"
             />
           ) : null}
+          {report.eta_curve?.points?.length ? (
+            <EtaCurvePlot curve={report.eta_curve} target={report.kappa_target} />
+          ) : null}
         </>
+      ) : null}
+      {sweep ? <RobustnessSweepPanel sweep={sweep} /> : null}
+    </>
+  );
+}
+
+function EtaCurvePlot({ curve, target }: { curve: EtaCurve; target: number | null }) {
+  return (
+    <LinePlot
+      title="T_drop vs projection η"
+      xLabel="η"
+      yLabel="T_drop"
+      x={curve.points.map((p) => p.eta)}
+      series={[
+        { name: "T_drop(η)", y: curve.points.map((p) => p.t_drop), kind: "drop" },
+        ...(target != null
+          ? [
+              {
+                name: "κ target",
+                y: curve.points.map(() => target),
+                kind: "mid" as const,
+              },
+            ]
+          : []),
+      ]}
+      markX={0.5}
+      xDigits={2}
+      yAuto
+      note={`Lower η grows Si (dilated / under-etch); higher η shrinks it (eroded / over-etch). Spread is ${fmt(curve.spread, 3)}. Worst |T_drop − κ| is ${fmt(curve.worst_abs_dkappa, 3)} at η = ${fmt(curve.worst_eta, 2)}. A layout that sits on target at η = 0.5 can still miss after litho bias.`}
+      noteLabel="Bias sweep"
+    />
+  );
+}
+
+function RobustnessSweepPanel({ sweep }: { sweep: TopologySweep }) {
+  const mfs = sweep.mfs_nm;
+  const robust = mfs.map((v) => sweep.rows.find((r) => r.mode === "robust" && r.mfs_nm === v));
+  const mid = mfs.map((v) => sweep.rows.find((r) => r.mode === "intermediate" && r.mfs_nm === v));
+  const yRobust = robust.map((r) => r?.worst_abs_dkappa ?? 0);
+  const yMid = mid.map((r) => r?.worst_abs_dkappa ?? 0);
+  const better = yRobust.map((a, i) => (Number.isFinite(a) && Number.isFinite(yMid[i]) ? yMid[i] - a : 0));
+  const wins = better.filter((d) => d > 0.01).length;
+  const note = `${sweep.note} Target κ is ${fmt(sweep.kappa_target, 3)}. In-loop robust TO beat intermediate-only at ${wins} of ${mfs.length} filter radii (lower worst |Δκ| is better).`;
+  return (
+    <>
+      <p className="bar-section">Robustness experiment</p>
+      <div className="metrics">
+        <Metric label="Steps / case" value={sweep.steps} />
+        <Metric label="κ target" value={fmt(sweep.kappa_target, 3)} />
+        <Metric
+          label="η-curve spread"
+          value={sweep.eta_curve ? fmt(sweep.eta_curve.spread, 3) : "—"}
+        />
+      </div>
+      <LinePlot
+        title="Worst |T_drop − κ| vs DUV MFS"
+        xLabel="MFS (nm)"
+        yLabel="max |Δκ|"
+        x={mfs}
+        series={[
+          { name: "robust (in-loop)", y: yRobust, kind: "through" },
+          { name: "intermediate only", y: yMid, kind: "drop" },
+        ]}
+        xDigits={0}
+        yAuto
+        note={note}
+        noteLabel="Sweep"
+      />
+      {sweep.eta_curve?.points?.length ? (
+        <EtaCurvePlot curve={sweep.eta_curve} target={sweep.kappa_target} />
       ) : null}
     </>
   );
@@ -2480,6 +3127,12 @@ function Heatmap({
   );
 }
 
+type PlotMark = {
+  x: number;
+  label?: string;
+  kind?: "laser" | "res" | "fwhm";
+};
+
 function LinePlot({
   title,
   xLabel,
@@ -2488,6 +3141,7 @@ function LinePlot({
   series,
   db = false,
   markX,
+  marks,
   xDigits,
   yAuto = false,
   note,
@@ -2500,6 +3154,7 @@ function LinePlot({
   series: { name: string; y: number[]; kind: "through" | "drop" | "mid" }[];
   db?: boolean;
   markX?: number;
+  marks?: PlotMark[];
   xDigits?: number;
   yAuto?: boolean;
   note?: string;
@@ -2560,9 +3215,24 @@ function LinePlot({
         {mapped.map((s) => (
           <path key={s.name} d={path(s.y)} className={s.kind} />
         ))}
-        {markX != null && markX >= xmin && markX <= xmax ? (
-          <line className="guide" x1={px(markX)} y1={y0} x2={px(markX)} y2={y0 + innerH} />
-        ) : null}
+        {(marks ?? (markX != null ? [{ x: markX, kind: "laser" as const }] : [])).map((m, i) =>
+          m.x >= xmin && m.x <= xmax ? (
+            <g key={`${m.kind ?? "mark"}-${i}`}>
+              <line
+                className={`guide ${m.kind ?? "laser"}`}
+                x1={px(m.x)}
+                y1={y0}
+                x2={px(m.x)}
+                y2={y0 + innerH}
+              />
+              {m.label ? (
+                <text className="mark-label" x={px(m.x) + 3} y={y0 + 10}>
+                  {m.label}
+                </text>
+              ) : null}
+            </g>
+          ) : null
+        )}
         <text x={x0} y={height - 6}>
           {xmin.toFixed(xd)}
         </text>
