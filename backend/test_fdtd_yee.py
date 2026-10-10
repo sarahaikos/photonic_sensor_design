@@ -47,6 +47,8 @@ class ConstructionTest(unittest.TestCase):
             YeeFdtd(np.ones((4, 4)), 1e-8, cfl=1.2)
         with self.assertRaises(ValueError):
             YeeFdtd(np.ones((4, 4)), 1e-8, dt=0.0)
+        with self.assertRaises(ValueError):
+            YeeFdtd(np.ones((4, 4)), 1e-8, sigma=-1.0)
 
 
 class OperatorStepTest(unittest.TestCase):
@@ -109,6 +111,30 @@ class OperatorStepTest(unittest.TestCase):
         expected = np.zeros(sim.shape)
         expected[2, 1, 0] = -sim.dt * 3.0 / (EPS0 * 2.0)
         np.testing.assert_allclose(sim.Ez, expected, atol=1e-20)
+
+    def test_conductivity_matches_the_centered_update(self):
+        dx = 2e-8
+        eps_r = 2.25
+        shape = (6, 5)
+        sim = YeeFdtd(np.full(shape, eps_r), dx, bc="periodic", cfl=0.6)
+        sigma = 0.25 * 2.0 * EPS0 * eps_r / sim.dt
+        beta = sigma * sim.dt / (2.0 * EPS0 * eps_r)
+        self.assertGreater(beta, 0.1)
+        lossy = YeeFdtd(np.full(shape, eps_r), dx, bc="periodic", dt=sim.dt, sigma=sigma)
+        rng = np.random.default_rng(9)
+        ez = rng.normal(size=shape)
+        lossy.set_electric(ez=ez, cosine_peak=True)
+        e0 = lossy.pack_e().copy()
+        h0 = lossy.pack_h().copy()
+        lossy.step()
+        ops = yee_operators(shape, dx, bc="periodic")
+        h = h0 - (lossy.dt / MU0) * (ops.Ce @ e0)
+        eps_vec = np.concatenate([np.full(shape, eps_r).ravel()] * 3)
+        beta_vec = np.full(eps_vec.shape, beta)
+        curl = (ops.Ch @ h) / eps_vec
+        e = ((1.0 - beta_vec) * e0 + (lossy.dt / EPS0) * curl) / (1.0 + beta_vec)
+        np.testing.assert_allclose(lossy.pack_h(), h, atol=1e-12)
+        np.testing.assert_allclose(lossy.pack_e(), e, atol=1e-12)
 
     def test_from_yee_grid_uses_mesh_spacing(self):
         grid = YeeGrid(
