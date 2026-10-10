@@ -10,6 +10,10 @@ thick, with no z-derivative. Spacing is in meters.
 ``E`` is sampled at integer steps and ``H`` at half-steps. For a uniform
 medium, ``H^{-1/2} = (Δt / 2μ₀) ∇×E^0`` puts every curl-curl eigenmode at a
 cosine peak.
+
+Electric conductivity uses the centered update of ``ε ∂E/∂t + σ E = ∇ × H``.
+A constant loss tangent ``σ = α ε₀ εᵣ`` then decays every mode at ``e^{-α t / 2}``,
+the same rate as the FDFD pole ``ω² + i α ω − ω₀² = 0``.
 """
 
 from __future__ import annotations
@@ -32,6 +36,7 @@ class YeeFdtd:
         bc: str | tuple[str, ...] = "periodic",
         cfl: float = 0.95,
         dt: float | None = None,
+        sigma=0.0,
     ):
         eps = np.asarray(eps_r, dtype=np.float64)
         if eps.ndim == 2:
@@ -72,6 +77,7 @@ class YeeFdtd:
         self.Hy = z.copy()
         self.Hz = z.copy()
         self.t_index = 0
+        self.sigma = self._prepare_sigma(sigma)
 
     def __repr__(self) -> str:
         return (
@@ -149,10 +155,20 @@ class YeeFdtd:
         e = self.pack_e()
         h = self.pack_h() - (self.dt / MU0) * (self._ops.Ce @ e)
         self.Hx, self.Hy, self.Hz = _as_fields(unpack_field(h, self.shape))
-        e = e + (self.dt / EPS0) * ((self._ops.Ch @ h) / self._permittivity_vector())
+        curl = (self._ops.Ch @ h) / self._permittivity_vector()
+        advance = (self.dt / EPS0) * curl
+        if self.sigma is None:
+            e = e + advance
+        else:
+            beta = self._sigma_vector() * self.dt / (2.0 * EPS0 * self._permittivity_vector())
+            e = ((1.0 - beta) * e + advance) / (1.0 + beta)
         self.Ex, self.Ey, self.Ez = _as_fields(unpack_field(e, self.shape))
         if jz is not None:
-            self.Ez = self.Ez - self.dt * self._coerce(jz) / (EPS0 * self.eps_r)
+            current = self.dt * self._coerce(jz) / (EPS0 * self.eps_r)
+            if self.sigma is not None:
+                beta_z = self.sigma * self.dt / (2.0 * EPS0 * self.eps_r)
+                current = current / (1.0 + beta_z)
+            self.Ez = self.Ez - current
         self.t_index += 1
 
     def run(self, steps: int, jz=None) -> None:
@@ -171,6 +187,29 @@ class YeeFdtd:
         electric = self.eps_r * (self.Ex**2 + self.Ey**2 + self.Ez**2)
         magnetic = self.Hx**2 + self.Hy**2 + self.Hz**2
         return 0.5 * volume * float(np.sum(EPS0 * electric + MU0 * magnetic))
+
+    def _prepare_sigma(self, sigma) -> np.ndarray | None:
+        """Cell-wise conductivity (S/m), or ``None`` when the grid is lossless."""
+        if sigma is None:
+            return None
+        arr = np.asarray(sigma, dtype=np.float64)
+        if arr.shape == ():
+            if float(arr) == 0.0:
+                return None
+            arr = np.full(self.shape, float(arr), dtype=np.float64)
+        else:
+            arr = self._coerce(arr)
+        if not np.isfinite(arr).all() or np.any(arr < 0.0):
+            raise ValueError("sigma must be finite and ≥ 0")
+        if not np.any(arr > 0.0):
+            return None
+        return np.ascontiguousarray(arr)
+
+    def _sigma_vector(self) -> np.ndarray:
+        flat = np.asarray(self.sigma, dtype=np.float64).ravel()
+        if flat.size != self._ops.n:
+            raise ValueError(f"sigma has {flat.size} cells, expected {self._ops.n}")
+        return np.concatenate((flat, flat, flat))
 
     def _permittivity_vector(self) -> np.ndarray:
         flat = np.asarray(self.eps_r, dtype=np.float64).ravel()
