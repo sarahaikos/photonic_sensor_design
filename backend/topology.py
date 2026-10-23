@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 import numpy as np
 
 from fdtd.geometry import Rect, Scene
+from mfs_brush import BRUSH_BETA, brush_report, length_scale_brushes, mfs_penalty
 from thermo import (
     DN_DT_SI,
     bicgstab_field,
@@ -77,6 +78,7 @@ def run_topology(
     dx_um = _dx_for(w_um, length_um, gap_um)
     xs, ys, rho0, design, guides = _raster(dx_um, w_um, length_um, gap_um, pad_um)
     r_px = float(np.clip(0.5 * mfs_nm / (dx_um * 1e3), 0.8, 2.4))
+    brushes = length_scale_brushes(mfs_nm, dx_um, w_um)
     beta = float(max(1.0, min(beta, 32.0)))
     steps = int(max(0, min(steps, 20)))
 
@@ -157,6 +159,7 @@ def run_topology(
             polarization=polarization,
             etch=etch,
             heat_circuit=heat_circuit,
+            brushes=brushes,
         )
 
     rho_f = helmholtz_filter(rho, r_px)
@@ -232,6 +235,7 @@ def run_topology(
                 else ""
             )
             + "; morphological litho-etch inside the sensitivity and on the GDS (not SEM-trained)"
+            + "; circular and notched-square brush penalties on linewidth, gap, and sidewall transitions (Hammond 2021)"
         ),
         "vectorizer": "marching squares + Ramer–Douglas–Peucker",
         "dx_nm": dx_um * 1e3,
@@ -277,6 +281,7 @@ def run_topology(
         "thermo_optic": bool(thermo_optic),
         "thermal": thermal,
         "field_t": field_t,
+        "brushes": brush_report(fabricated, brushes, design if design.any() else np.ones_like(fabricated, dtype=bool)),
     }
 
 
@@ -659,6 +664,7 @@ def _sweep_case(
     dx_um = _dx_for(w_um, length_um, gap_um)
     xs, ys, rho0, design, _guides = _raster(dx_um, w_um, length_um, gap_um)
     r_px = float(np.clip(0.5 * mfs_nm / (dx_um * 1e3), 0.8, 2.4))
+    brushes = length_scale_brushes(mfs_nm, dx_um, w_um)
     rho = rho0.copy()
     if design.any():
         rho = _seed_swg(rho, design, ys, dx_um)
@@ -679,6 +685,7 @@ def _sweep_case(
         target,
         robust=robust,
         polarization=polarization,
+        brushes=brushes,
     )
     rho_f = helmholtz_filter(rho, r_px)
     variants = {name: _project_design(rho_f, design, rho0, beta, eta) for name, eta in _ROBUST_ETAS}
@@ -776,13 +783,16 @@ def _optimize(
     polarization: str = "TM",
     etch=None,
     heat_circuit=None,
+    brushes=None,
 ):
     """Sum the κ error of every scored blueprint, then step on that gradient.
 
     With heaters, each blueprint adds heater-off, heater-on, (κ_hot − κ_off)²,
     and the ring resonance shift. Heat is the chip-scale solve; the coupler
     window samples that temperature. The grayscale penalty stays on the
-    intermediate projection before etch.
+    intermediate projection before etch. Circular and notched-square brush
+    penalties add a second step, normalized on their own, so a sub-resolution
+    notch or a thin sidewall moves even when the optical gradient is larger.
     """
     history = []
     field_ez = None
@@ -897,7 +907,37 @@ def _optimize(
                 complete = False
             else:
                 pieces.append(piece)
-        obj = scored + gray_w * gray
+        brush_terms = None
+        brush_sens = None
+        if brushes is not None and design.any():
+            brush_sens = np.zeros_like(rho, dtype=float)
+            summed = None
+            n_blue = 0
+            for name, _eta in etas:
+                corner = by_key.get((name, "off"))
+                if corner is None:
+                    continue
+                terms, g_sim = mfs_penalty(corner["rho_p"], brushes, design, BRUSH_BETA)
+                brush_sens = brush_sens + _chain_density_gradient(
+                    g_sim,
+                    corner["rho_proj"],
+                    rho_f,
+                    design,
+                    beta,
+                    corner["eta"],
+                    r_px,
+                    etch,
+                )
+                n_blue += 1
+                summed = terms if summed is None else {key: summed[key] + terms[key] for key in terms}
+            if n_blue:
+                brush_terms = {key: value / n_blue for key, value in summed.items()}
+                brush_sens = brush_sens / n_blue
+            else:
+                brush_sens = None
+        brush_w = _brush_weight(k, steps)
+        brush_val = float(brush_terms["total"]) if brush_terms else 0.0
+        obj = scored + gray_w * gray + brush_w * brush_val
         rec = {
             "step": k + 1,
             "objective": float(obj),
@@ -919,6 +959,12 @@ def _optimize(
             rec["t_drop_hot"] = by_key[("intermediate", "hot")]["t_drop"]
             rec["shift_nm"] = by_key[("intermediate", "hot")].get("shift_nm", 0.0)
             rec["dt_ring_k"] = by_key[("intermediate", "hot")].get("dt_ring_k", 0.0)
+        if brush_terms is not None:
+            rec["brush"] = brush_val
+            rec["brush_width"] = float(brush_terms["width"])
+            rec["brush_gap"] = float(brush_terms["gap"])
+            rec["brush_notch"] = float(brush_terms["notch"])
+            rec["brush_weight"] = float(brush_w)
         history.append(rec)
         if mid["e_fwd"] is not None:
             field_ez = _ez_field(xs, ys, mid["e_fwd"])
@@ -931,6 +977,10 @@ def _optimize(
         rec["gradient"] = "optical+heat" if heat_used else "optical"
         peak = float(np.max(np.abs(sens[design]))) if design.any() else 1.0
         step = 0.05 * sens / (peak + 1e-12)
+        if brush_sens is not None and np.isfinite(brush_sens).all():
+            b_peak = float(np.max(np.abs(brush_sens[design]))) if design.any() else 0.0
+            if b_peak > 1e-10:
+                step = step + 0.05 * brush_w * brush_sens / b_peak
         updated = np.clip(rho - step, 0.0, 1.0)
         rho = np.where(design, 0.75 * rho + 0.25 * updated, rho)
     return rho, history, t_th, t_dr, field_ez
@@ -1395,12 +1445,26 @@ def _density_sensitivity(
             dndt_clad,
         )
     sens_sim = direct + thermal
+    return _chain_density_gradient(
+        sens_sim, rho_proj, rho_f, design, beta, corner["eta"], r_px, etch
+    )
+
+
+def _chain_density_gradient(sens_sim, rho_proj, rho_f, design, beta, eta, r_px, etch):
+    """Map ∂J/∂ρ_etched through litho-etch, tanh projection, and the Helmholtz filter."""
     if etch is None:
         sens_proj = sens_sim
     else:
         sens_proj = _etch_vjp(np.where(design, sens_sim, 0.0), rho_proj, etch[0], etch[1])
-    sens_f = np.where(design, sens_proj * project_grad(rho_f, beta, corner["eta"]), 0.0)
+    sens_f = np.where(design, sens_proj * project_grad(rho_f, beta, eta), 0.0)
     return helmholtz_filter(sens_f, r_px, clip=False) * design
+
+
+def _brush_weight(step_index: int, steps: int) -> float:
+    """Ramp the feature-size step from a light touch to a full optical-sized step."""
+    if steps <= 1:
+        return 1.0
+    return 0.35 + 0.65 * (float(step_index) / float(steps - 1))
 
 
 def _cocg(op, b, x0=None, tol=_SOLVE_TOL, maxiter=_SOLVE_ITERS):
