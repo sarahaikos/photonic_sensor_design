@@ -14,6 +14,9 @@ cosine peak.
 Electric conductivity uses the centered update of ``ε ∂E/∂t + σ E = ∇ × H``.
 A constant loss tangent ``σ = α ε₀ εᵣ`` then decays every mode at ``e^{-α t / 2}``,
 the same rate as the FDFD pole ``ω² + i α ω − ω₀² = 0``.
+
+A Lorentz pole adds the polarization from ``ade_lorentz_coeff``. The grid
+permittivity is ε∞. The pole can cover every cell or only a mask.
 """
 
 from __future__ import annotations
@@ -21,7 +24,7 @@ from __future__ import annotations
 import numpy as np
 
 from fdfd.operators import YeeOperators, pack_field, unpack_field, yee_operators
-from fdtd.materials import EPS0, MU0
+from fdtd.materials import EPS0, MU0, Pole, ade_lorentz_coeff, _pole_permittivity
 
 C_LIGHT = 1.0 / float(np.sqrt(EPS0 * MU0))
 
@@ -37,6 +40,8 @@ class YeeFdtd:
         cfl: float = 0.95,
         dt: float | None = None,
         sigma=0.0,
+        poles=None,
+        pole_mask=None,
     ):
         eps = np.asarray(eps_r, dtype=np.float64)
         if eps.ndim == 2:
@@ -78,6 +83,8 @@ class YeeFdtd:
         self.Hz = z.copy()
         self.t_index = 0
         self.sigma = self._prepare_sigma(sigma)
+        self._lorentz = self._prepare_lorentz(poles, pole_mask)
+        self._e_prev = np.zeros(self._ops.n * 3, dtype=np.float64) if self._lorentz else None
 
     def __repr__(self) -> str:
         return (
@@ -138,6 +145,11 @@ class YeeFdtd:
         self.Hy = self._coerce(hy)
         self.Hz = self._coerce(hz)
         self.t_index = 0
+        for item in self._lorentz:
+            item["p"] = np.zeros_like(item["p"])
+            item["p_prev"] = np.zeros_like(item["p_prev"])
+        if self._e_prev is not None:
+            self._e_prev = np.zeros_like(self._e_prev)
 
     def set_electric(self, ex=0.0, ey=0.0, ez=0.0, *, cosine_peak: bool = False) -> None:
         """Load ``E^0`` and reset the clock.
@@ -150,18 +162,45 @@ class YeeFdtd:
             half = (self.dt / (2.0 * MU0)) * (self._ops.Ce @ self.pack_e())
             self.Hx, self.Hy, self.Hz = _as_fields(unpack_field(half, self.shape))
 
+    def prime_lorentz(self, omega: float) -> None:
+        """Set P at t = 0 and t = −Δt for a harmonic field already stored in E.
+
+        χ is the Lorentz susceptibility at ``omega``. This removes the startup
+        transient when the field is already the dispersive mode.
+        """
+        if not self._lorentz:
+            raise ValueError("no Lorentz poles to prime")
+        frequency = float(omega)
+        if not np.isfinite(frequency) or frequency <= 0.0:
+            raise ValueError("omega must be positive")
+        electric = self.pack_e()
+        phase = frequency * self.dt
+        cosine = float(np.cos(phase))
+        sine = float(np.sin(phase))
+        # E is at a cosine peak. One step earlier it has advanced by ω Δt.
+        self._e_prev = np.ascontiguousarray(cosine * electric, dtype=np.float64)
+        for item in self._lorentz:
+            chi = _pole_permittivity(item["pole"], frequency)
+            now = EPS0 * (chi.real * item["mask_vec"] * electric)
+            earlier = EPS0 * (chi.real * cosine - chi.imag * sine) * item["mask_vec"] * electric
+            item["p"] = np.ascontiguousarray(now, dtype=np.float64)
+            item["p_prev"] = np.ascontiguousarray(earlier, dtype=np.float64)
+
     def step(self, jz=None) -> None:
         """Advance one leapfrog step. ``jz`` is an electric current density on ``Ez``."""
         e = self.pack_e()
         h = self.pack_h() - (self.dt / MU0) * (self._ops.Ce @ e)
         self.Hx, self.Hy, self.Hz = _as_fields(unpack_field(h, self.shape))
-        curl = (self._ops.Ch @ h) / self._permittivity_vector()
-        advance = (self.dt / EPS0) * curl
-        if self.sigma is None:
-            e = e + advance
+        if self._lorentz:
+            e = self._advance_lorentz(e, h)
         else:
-            beta = self._sigma_vector() * self.dt / (2.0 * EPS0 * self._permittivity_vector())
-            e = ((1.0 - beta) * e + advance) / (1.0 + beta)
+            curl = (self._ops.Ch @ h) / self._permittivity_vector()
+            advance = (self.dt / EPS0) * curl
+            if self.sigma is None:
+                e = e + advance
+            else:
+                beta = self._sigma_vector() * self.dt / (2.0 * EPS0 * self._permittivity_vector())
+                e = ((1.0 - beta) * e + advance) / (1.0 + beta)
         self.Ex, self.Ey, self.Ez = _as_fields(unpack_field(e, self.shape))
         if jz is not None:
             current = self.dt * self._coerce(jz) / (EPS0 * self.eps_r)
@@ -187,6 +226,63 @@ class YeeFdtd:
         electric = self.eps_r * (self.Ex**2 + self.Ey**2 + self.Ez**2)
         magnetic = self.Hx**2 + self.Hy**2 + self.Hz**2
         return 0.5 * volume * float(np.sum(EPS0 * electric + MU0 * magnetic))
+
+    def _advance_lorentz(self, e: np.ndarray, h: np.ndarray) -> np.ndarray:
+        """E update with ∇×H = ε0 ε∞ ∂E/∂t + Σ ∂P/∂t + σ E, P from the ADE."""
+        curl_h = self._ops.Ch @ h
+        eps_vec = self._permittivity_vector()
+        earlier = self._e_prev
+        num = EPS0 * eps_vec * e + self.dt * curl_h
+        den = EPS0 * eps_vec.copy()
+        if self.sigma is not None:
+            half = 0.5 * self.dt * self._sigma_vector()
+            num = num - half * e
+            den = den + half
+        for item in self._lorentz:
+            drive = item["c3"]
+            num = num + (1.0 - item["c1"]) * item["p"] - item["c2"] * item["p_prev"]
+            num = num - 2.0 * drive * e - drive * earlier
+            den = den + drive
+        updated = num / den
+        for item in self._lorentz:
+            previous = item["p"]
+            averaged = updated + 2.0 * e + earlier
+            item["p"] = item["c1"] * item["p"] + item["c2"] * item["p_prev"] + item["c3"] * averaged
+            item["p_prev"] = previous
+        self._e_prev = np.ascontiguousarray(e, dtype=np.float64)
+        return updated
+
+    def _prepare_lorentz(self, poles, pole_mask) -> list[dict]:
+        if poles is None:
+            return []
+        if isinstance(poles, Pole):
+            poles = (poles,)
+        items = tuple(poles)
+        if not items:
+            return []
+        if pole_mask is None:
+            mask = np.ones(self.shape, dtype=np.float64)
+        else:
+            mask = self._coerce(pole_mask)
+        if not np.isfinite(mask).all() or np.any(mask < 0.0) or np.any(mask > 1.0):
+            raise ValueError("pole_mask must be finite and in [0, 1]")
+        mask_vec = np.concatenate((mask.ravel(), mask.ravel(), mask.ravel()))
+        prepared = []
+        width = self._ops.n * 3
+        for pole in items:
+            coeff = ade_lorentz_coeff(pole, self.dt)
+            prepared.append(
+                {
+                    "pole": pole,
+                    "c1": float(coeff["c1"]),
+                    "c2": float(coeff["c2"]),
+                    "c3": float(coeff["c3"]) * mask_vec,
+                    "mask_vec": mask_vec,
+                    "p": np.zeros(width, dtype=np.float64),
+                    "p_prev": np.zeros(width, dtype=np.float64),
+                }
+            )
+        return prepared
 
     def _prepare_sigma(self, sigma) -> np.ndarray | None:
         """Cell-wise conductivity (S/m), or ``None`` when the grid is lossless."""

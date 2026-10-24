@@ -1,8 +1,8 @@
 """Linear and dispersive material models (constant, Debye, Lorentz, Drude).
 
-Time-domain updates use ADE (auxiliary differential equation). PLRC coefficients
-are stored for the same poles so a convolutional engine can swap in later.
-``permittivity`` evaluates those poles at one real frequency (e^{-iωt}).
+``permittivity`` evaluates the poles at one real frequency (e^{-iωt}).
+A Lorentz pole also has centered auxiliary-differential-equation coefficients
+for the Yee stepper. Debye and Drude stay frequency-domain.
 """
 
 from __future__ import annotations
@@ -122,14 +122,29 @@ def material_for_clad(n_clad: float) -> Material:
 
 
 def ade_lorentz_coeff(pole: Pole, dt: float) -> dict:
-    """ADE coefficients for P^{n+1} = C1 P^n + C2 P^{n-1} + C3 E^{n+1}."""
-    w0, g, de = pole.omega0, pole.gamma, pole.eps_delta
-    den = 1.0 + g * dt + 0.25 * (w0 * dt) ** 2
+    """Centered ADE coefficients for one Lorentz pole.
+
+    The oscillator is the same one ``permittivity`` evaluates,
+    ∂²P/∂t² + γ ∂P/∂t + ω0² P = ε0 Δε ω0² E. Both P and E are averaged over
+    the same three time levels, which keeps the loss term accurate when
+    ω Δt is only moderately small:
+
+        P^{n+1} = c1 P^n + c2 P^{n-1} + c3 (E^{n+1} + 2 E^n + E^{n-1})
+    """
+    if pole.kind != "lorentz":
+        raise ValueError("ADE coefficients are for a Lorentz pole")
+    w0, g, de = float(pole.omega0), float(pole.gamma), float(pole.eps_delta)
+    step = float(dt)
+    if w0 <= 0.0 or g < 0.0 or step <= 0.0 or not math.isfinite(de):
+        raise ValueError("Lorentz pole needs ω0 > 0, γ ≥ 0, and Δt > 0")
+    half_damp = 0.5 * g * step
+    w2 = 0.25 * (w0 * step) ** 2
+    den = 1.0 + half_damp + w2
     return {
         "kind": pole.kind,
-        "c1": (2.0 - 0.5 * (w0 * dt) ** 2) / den,
-        "c2": -(1.0 - g * dt + 0.25 * (w0 * dt) ** 2) / den,
-        "c3": de * EPS0 * (w0 * dt) ** 2 / den,
+        "c1": (2.0 - 2.0 * w2) / den,
+        "c2": -(1.0 - half_damp + w2) / den,
+        "c3": de * EPS0 * (w0 * step) ** 2 / (4.0 * den),
     }
 
 
