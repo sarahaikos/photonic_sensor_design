@@ -6,6 +6,7 @@ from circuit import analyze_circuit
 from coupler import analyze_coupler
 from detector import analyze_detector
 from fdtd.setup import run_fdtd
+from inverse.pipeline import Stack, SystemObjective, run_inverse
 from ring import analyze_ring
 from topology import run_robustness_sweep, run_topology
 from waveguide import analyze_waveguide
@@ -163,3 +164,53 @@ def topology_sweep(payload: TopologyInput):
     if result.get("error"):
         raise HTTPException(status_code=400, detail=result["error"])
     return result
+
+
+class InverseInput(BaseModel):
+    width_nm: float = Field(default=450.0, gt=0)
+    height_nm: float = Field(default=220.0, gt=0)
+    wavelength_nm: float = Field(default=1550.0, gt=0)
+    n_clad: float = Field(default=1.33, gt=0)
+    polarization: str = Field(default="TE", pattern="^(TE|TM)$")
+    config: str = Field(default="all-pass", pattern="^(all-pass|add-drop|both)$")
+    steps: int = Field(default=12, ge=1, le=30)
+    step_size: float = Field(default=0.03, gt=0, le=0.5)
+    kappa_target: float = Field(default=0.1, gt=0, lt=1)
+    kappa_weight: float = Field(default=1.0, ge=0)
+    q_target: float | None = Field(default=None, gt=0)
+    q_weight: float = Field(default=0.0, ge=0)
+    sensitivity_weight: float = Field(default=0.0, ge=0)
+    extinction_weight: float = Field(default=0.0, ge=0)
+    extinction_target_db: float = Field(default=10.0, ge=0)
+    thermal_lambda_weight: float = Field(default=0.0, ge=0)
+    thermal_kappa_weight: float = Field(default=0.0, ge=0)
+    lod_weight: float = Field(default=0.0, ge=0)
+
+
+@app.post("/api/inverse")
+def inverse_design(payload: InverseInput):
+    """Outer DAG choice, then Adam on the free device parameters."""
+    return run_inverse(
+        Stack(
+            width_nm=payload.width_nm,
+            height_nm=payload.height_nm,
+            wavelength_nm=payload.wavelength_nm,
+            n_clad=payload.n_clad,
+            polarization=payload.polarization,
+        ),
+        config=payload.config,
+        objective=SystemObjective(
+            sensitivity_weight=payload.sensitivity_weight,
+            q_weight=payload.q_weight,
+            q_target=payload.q_target,
+            extinction_weight=payload.extinction_weight,
+            extinction_target_db=payload.extinction_target_db,
+            thermal_lambda_weight=payload.thermal_lambda_weight,
+            thermal_kappa_weight=payload.thermal_kappa_weight,
+            lod_weight=payload.lod_weight,
+            kappa_weight=payload.kappa_weight,
+            kappa_target=payload.kappa_target,
+        ),
+        steps=payload.steps,
+        step_size=payload.step_size,
+    )

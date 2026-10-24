@@ -304,6 +304,18 @@ type TopologyResult = {
   kappa: number | null;
   grayscale: number;
   drc: TopologyDrc;
+  brushes?: {
+    method: string;
+    reference: string;
+    circular_radius_nm: number;
+    notched_side_nm: number;
+    notch_nm: number;
+    enforced_feature_nm: number;
+    width: number;
+    gap: number;
+    notch: number;
+    total: number;
+  };
   history: {
     step: number;
     objective: number;
@@ -320,6 +332,11 @@ type TopologyResult = {
     t_drop_eroded?: number;
     t_drop_off?: number;
     t_drop_hot?: number;
+    brush?: number;
+    brush_width?: number;
+    brush_gap?: number;
+    brush_notch?: number;
+    brush_weight?: number;
   }[];
   robust?: {
     dilated?: { t_through: number; t_drop: number };
@@ -2351,7 +2368,16 @@ function topologyObjectiveNote(report: TopologyResult): string {
   const both = report.thermo_optic
     ? " Heat is the chip-scale solve, sampled onto the coupler. The ring shift uses that same temperature, and both enter the heat adjoint."
     : " Every step differentiates dilated, intermediate, and eroded.";
-  return `Each point is ${scored}, plus a small grayscale penalty on the intended layout.${tgt} The curve ${trend}.${both}${lastWorst}${hot}${shift}`;
+  const brush = report.brushes
+    ? " A second step follows the circular and notched-square brush gradients, so linewidth, gap, and sidewall jogs move even when the optical gradient is larger. That weight ramps up during the run."
+    : "";
+  return `Each point is ${scored}, plus a small grayscale penalty on the intended layout and the brush penalty on each blueprint.${tgt} The curve ${trend}.${both}${brush}${lastWorst}${hot}${shift}`;
+}
+
+function topologyBrushNote(report: TopologyResult): string {
+  const brushes = report.brushes;
+  if (!brushes) return "";
+  return `Circular brush radius ${fmt(brushes.circular_radius_nm, 0)} nm (about ${fmt(brushes.enforced_feature_nm, 0)} nm across on this grid) penalizes silicon thinner than the brush and gaps the brush cannot enter. The notched square is ${fmt(brushes.notched_side_nm, 0)} nm on a side with ${fmt(brushes.notch_nm, 0)} nm corners removed, so a jog or notch in the sidewall is penalized too. Lower is closer to a legal transition.`;
 }
 
 function topologyTDropNote(
@@ -2405,7 +2431,11 @@ function topologyDensityNote(
     report.t_drop != null
       ? ` Intermediate T_drop is ${fmt(report.t_drop, 3)}.`
       : "";
-  return `Dark is silicon after Helmholtz filtering, tanh projection at η = ${fmt(etas.intermediate, 2)} (the layout you would write), and litho/etch bias. Fill is ${fmt(fillPct, 0)}%. ${grayBit} ${mfs}; ${gap}.${t} ${report.polygon_count} polygon${report.polygon_count === 1 ? "" : "s"} in the GDS.`;
+  const brushes = report.brushes;
+  const brushBit = brushes
+    ? ` Brush penalties on this density: linewidth ${fmt(brushes.width, 3)}, gap ${fmt(brushes.gap, 3)}, notch ${fmt(brushes.notch, 3)}.`
+    : "";
+  return `Dark is silicon after Helmholtz filtering, tanh projection at η = ${fmt(etas.intermediate, 2)} (the layout you would write), and litho/etch bias. Fill is ${fmt(fillPct, 0)}%. ${grayBit} ${mfs}; ${gap}.${brushBit}${t} ${report.polygon_count} polygon${report.polygon_count === 1 ? "" : "s"} in the GDS.`;
 }
 
 function topologyBiasNote(
@@ -2446,8 +2476,9 @@ function TopologyPanel({
         Density TO of the coupler: Helmholtz filter and tanh projection for DUV min
         feature size. Each step sums the κ error of dilated / intermediate / eroded
         (η = {fmt(etas.dilated, 2)} / {fmt(etas.intermediate, 2)} / {fmt(etas.eroded, 2)};
-        Piggott / Wang), including litho/etch bias, then writes GDS. Same 2.5D strip as
-        FDTD — not a 3D ring solve.
+        Piggott / Wang), including litho/etch bias, then adds circular and notched-square
+        brush penalties so a sidewall transition cannot keep a sub-resolution notch.
+        Writes GDS. Same 2.5D strip as FDTD — not a 3D ring solve.
       </p>
       <div className="spectrum-toolbar" style={{ justifyContent: "flex-start", gap: 8 }}>
         <button type="button" onClick={() => onRun()} disabled={busy || sweepBusy}>
@@ -2483,6 +2514,16 @@ function TopologyPanel({
               label="Gap"
               value={report.drc.gap_ok ? `${fmt(report.drc.min_gap_meas_nm, 0)} nm` : "fail"}
             />
+            {report.brushes ? (
+              <Metric
+                label="Brush linewidth"
+                value={fmt(report.brushes.width, 3)}
+              />
+            ) : null}
+            {report.brushes ? <Metric label="Brush gap" value={fmt(report.brushes.gap, 3)} /> : null}
+            {report.brushes ? (
+              <Metric label="Notched square" value={fmt(report.brushes.notch, 3)} />
+            ) : null}
             <Metric label="Polygons" value={report.polygon_count} />
           </div>
           <p className="muted">
@@ -2550,8 +2591,8 @@ function TopologyPanel({
                 xLabel="Step"
                 yLabel={
                   report.thermo_optic
-                    ? "Σ (T−κ)² + drift + (Δλ)²"
-                    : "Σ (T_drop − target)²"
+                    ? "Σ (T−κ)² + drift + (Δλ)² + brush"
+                    : "Σ (T_drop − target)² + brush"
                 }
                 x={report.history.map((h) => h.step)}
                 series={[
@@ -2566,6 +2607,37 @@ function TopologyPanel({
                 note={topologyObjectiveNote(report)}
                 noteLabel="Objective"
               />
+              {report.history.every(
+                (h) => h.brush_width != null && h.brush_gap != null && h.brush_notch != null
+              ) ? (
+                <LinePlot
+                  title="Feature-size brush penalty"
+                  xLabel="Step"
+                  yLabel="mean squared mismatch"
+                  x={report.history.map((h) => h.step)}
+                  series={[
+                    {
+                      name: "linewidth",
+                      y: report.history.map((h) => h.brush_width as number),
+                      kind: "through",
+                    },
+                    {
+                      name: "gap",
+                      y: report.history.map((h) => h.brush_gap as number),
+                      kind: "drop",
+                    },
+                    {
+                      name: "notched square",
+                      y: report.history.map((h) => h.brush_notch as number),
+                      kind: "mid",
+                    },
+                  ]}
+                  yAuto
+                  xDigits={0}
+                  note={topologyBrushNote(report)}
+                  noteLabel="Brushes"
+                />
+              ) : null}
               {report.history.every(
                 (h) =>
                   h.t_drop_dilated != null &&

@@ -14,6 +14,11 @@ shape alone and moves the pole to
     ω² + i α ω − ω₀² = 0,    Q = Re(ω) / α.
 
 The field amplitude decays as ``e^{-α t / 2}``.
+
+A Lorentz pole makes ε depend on frequency. FDFD rebuilds Re ε(ω) and
+resolves the curl-curl mode until ω is consistent with that permittivity.
+The decay comes from the energy-weighted Im ε. FDTD steps the same pole
+with the auxiliary polarization update.
 """
 
 from __future__ import annotations
@@ -23,7 +28,7 @@ from scipy import sparse
 from scipy.sparse.linalg import eigsh
 
 from fdfd.operators import yee_operators
-from fdtd.materials import EPS0, MU0
+from fdtd.materials import EPS0, MU0, _pole_permittivity
 from fdtd.yee import C_LIGHT, YeeFdtd
 
 
@@ -39,8 +44,27 @@ def block_permittivity(
     if nx < 8 or ny < 8:
         raise ValueError("cavity grid must be at least 8 cells on a side")
     eps = np.full((nx, ny), float(eps_bg), dtype=np.float64)
-    eps[nx // 5 : 4 * nx // 5, ny // 4 : 3 * ny // 4] = float(eps_core)
+    xs, ys = _block_slices((nx, ny))
+    eps[xs, ys] = float(eps_core)
     return eps
+
+
+def block_mask(shape: tuple[int, int]) -> np.ndarray:
+    """Cells of the dielectric block in ``block_permittivity``."""
+    mask = np.zeros((int(shape[0]), int(shape[1])), dtype=np.float64)
+    xs, ys = _block_slices(mask.shape)
+    mask[xs, ys] = 1.0
+    return mask
+
+
+def permittivity_at(eps_inf, mask, pole, omega: float) -> np.ndarray:
+    """ε∞ plus the real Lorentz susceptibility at one frequency, on ``mask``."""
+    grid = np.asarray(eps_inf, dtype=np.float64)
+    weight = np.asarray(mask, dtype=np.float64)
+    if grid.shape != weight.shape:
+        raise ValueError("mask shape must match eps_inf")
+    chi = _pole_permittivity(pole, float(omega))
+    return grid + weight * float(chi.real)
 
 
 def fdfd_resonance(
@@ -132,7 +156,167 @@ def compare_resonances(
     }
 
 
-def _fundamental(eps: np.ndarray, spacing, bc) -> tuple[float, np.ndarray]:
+def fdfd_dispersive_resonance(
+    eps_inf,
+    mask,
+    pole,
+    spacing: float | tuple[float, ...],
+    *,
+    bc: str | tuple[str, ...] = "pec",
+    iterations: int = 24,
+) -> dict:
+    """TMz resonance whose permittivity is the Lorentz pole at that same ω.
+
+    Each pass rebuilds Re ε(ω) on the masked cells and resolves the real
+    curl-curl mode. Iteration stops when that mode's frequency is the ω the
+    permittivity was built from. With that mode held fixed, a scalar Newton
+    solve then moves ω into the complex plane so ω² ε(ω) stays on the same
+    Rayleigh quotient. That complex root is the decay the FDTD ringdown sees.
+    """
+    grid = np.asarray(eps_inf, dtype=np.float64)
+    weight = np.asarray(mask, dtype=np.float64)
+    if grid.ndim != 2 or grid.shape != weight.shape:
+        raise ValueError("eps_inf and mask must be matching 2D grids")
+    if getattr(pole, "kind", None) != "lorentz":
+        raise ValueError("dispersive resonance uses a Lorentz pole")
+
+    def _at(query: float):
+        built = permittivity_at(grid, weight, pole, query)
+        if np.any(built <= 0.0) or not np.isfinite(built).all():
+            raise RuntimeError("dispersive permittivity left the positive reals")
+        found, mode = _fundamental(built, spacing, bc, sigma_omega=query)
+        return found, mode, built
+
+    # Secant on f(ω) = ω_eig(ε(ω)) − ω. The first sample is the nondispersive cavity.
+    omega, _bare = _fundamental(grid, spacing, bc)
+    eig, ez, eps = _at(omega)
+    previous_query, previous_gap = omega, eig - omega
+    query = eig
+    for _ in range(int(iterations)):
+        eig, ez, eps = _at(query)
+        gap = eig - query
+        if abs(gap) <= 1e-11 * abs(eig):
+            omega = eig
+            break
+        denom = gap - previous_gap
+        if abs(denom) <= 1e-30 * abs(gap):
+            nxt = 0.5 * (query + eig)
+        else:
+            nxt = query - gap * (query - previous_query) / denom
+        if not np.isfinite(nxt) or nxt <= 0.0 or abs(nxt - query) > 0.5 * query:
+            nxt = 0.5 * (query + eig)
+        previous_query, previous_gap = query, gap
+        query = float(nxt)
+    else:
+        raise RuntimeError("dispersive resonance did not converge")
+    omega, gamma = _complex_pole(grid, weight, pole, eps, ez, omega)
+    return {
+        "omega": omega,
+        "gamma": gamma,
+        "wavelength_nm": _wavelength_nm(omega),
+        "q": None if abs(gamma) <= 1e-30 * omega else float(omega / (2.0 * abs(gamma))),
+        "ez": ez,
+        "eps": eps,
+    }
+
+
+def fdtd_dispersive_resonance(
+    eps_inf,
+    mask,
+    pole,
+    spacing: float | tuple[float, ...],
+    ez,
+    *,
+    omega_hint: float,
+    bc: str | tuple[str, ...] = "pec",
+    cfl: float = 0.5,
+    steps: int = 1600,
+) -> dict:
+    """Ringdown of a Lorentz block. ``omega_hint`` only sets the initial polarization."""
+    sim = YeeFdtd(eps_inf, spacing, bc=bc, cfl=cfl, poles=(pole,), pole_mask=mask)
+    sim.set_electric(ez=ez, cosine_peak=True)
+    sim.prime_lorentz(omega_hint)
+    series = _project(sim, ez, int(steps))
+    omega, gamma, residual = _fit_damped_cosine(series, sim.dt)
+    corrected = _leapfrog_to_spatial(omega, sim.dt)
+    return {
+        "omega": omega,
+        "omega_corrected": corrected,
+        "gamma": gamma,
+        "wavelength_nm": _wavelength_nm(omega),
+        "wavelength_corrected_nm": _wavelength_nm(corrected),
+        "q": omega / (2.0 * abs(gamma)),
+        "q_corrected": corrected / (2.0 * abs(gamma)),
+        "fit_residual": residual,
+        "dt": sim.dt,
+        "steps": int(steps),
+    }
+
+
+def compare_dispersive_resonance(
+    eps_inf,
+    mask,
+    pole,
+    spacing: float | tuple[float, ...],
+    *,
+    frozen_omega: float = 0.0,
+    bc: str | tuple[str, ...] = "pec",
+    cfl: float = 0.5,
+    steps: int = 1600,
+) -> dict:
+    """Live dispersive resonance against FDTD, and against ε frozen at another ω."""
+    live = fdfd_dispersive_resonance(eps_inf, mask, pole, spacing, bc=bc)
+    time = fdtd_dispersive_resonance(
+        eps_inf,
+        mask,
+        pole,
+        spacing,
+        live["ez"],
+        omega_hint=live["omega"],
+        bc=bc,
+        cfl=cfl,
+        steps=steps,
+    )
+    frozen = fdfd_resonance(permittivity_at(eps_inf, mask, pole, frozen_omega), spacing, bc=bc)
+    return {"fdfd": live, "fdtd": time, "frozen": frozen}
+
+
+def _complex_pole(grid, weight, pole, eps, ez, omega: float) -> tuple[float, float]:
+    """ω whose complex permittivity keeps the real mode's Rayleigh quotient."""
+    energy = float(np.sum(eps * ez**2))
+    target = float(omega) ** 2 * energy
+    shape = ez**2
+
+    def mismatch(probe: complex) -> complex:
+        chi = _pole_permittivity(pole, probe)
+        density = np.asarray(grid, dtype=np.float64) + np.asarray(weight, dtype=np.float64) * chi
+        return probe**2 * np.sum(density * shape) - target
+
+    chi0 = _pole_permittivity(pole, omega)
+    seed = -float(omega) * float(np.sum(np.asarray(weight) * chi0.imag * shape)) / (2.0 * energy)
+    probe = complex(float(omega), seed)
+    for _ in range(12):
+        gap = mismatch(probe)
+        if abs(gap) <= 1e-12 * abs(target):
+            break
+        step = 1e-6 * abs(probe)
+        slope = (mismatch(probe + step) - mismatch(probe - step)) / (2.0 * step)
+        if slope == 0:
+            raise RuntimeError("complex dispersive pole did not converge")
+        probe = probe - gap / slope
+    else:
+        raise RuntimeError("complex dispersive pole did not converge")
+    if not np.isfinite(probe.real) or not np.isfinite(probe.imag):
+        raise RuntimeError("complex dispersive pole did not converge")
+    return float(probe.real), float(probe.imag)
+
+
+def _block_slices(shape: tuple[int, int]) -> tuple[slice, slice]:
+    nx, ny = int(shape[0]), int(shape[1])
+    return slice(nx // 5, 4 * nx // 5), slice(ny // 4, 3 * ny // 4)
+
+
+def _fundamental(eps: np.ndarray, spacing, bc, sigma_omega: float | None = None) -> tuple[float, np.ndarray]:
     ops = yee_operators(eps.shape, spacing, bc=bc)
     # TMz: (∇ × ∇ × Ez) = -(∂xb ∂xf + ∂yb ∂yf) Ez = ω₀² μ₀ ε₀ εᵣ Ez.
     laplace = -(ops.Dxb @ ops.Dxf + ops.Dyb @ ops.Dyf).astype(np.float64)
@@ -145,7 +329,12 @@ def _fundamental(eps: np.ndarray, spacing, bc) -> tuple[float, np.ndarray]:
         / n_avg
         * np.sqrt(1.0 / (eps.shape[0] * dx) ** 2 + 1.0 / (eps.shape[1] * dy) ** 2)
     )
-    vals, vecs = eigsh(laplace, k=3, M=mass, sigma=(0.35 * guess) ** 2, which="LM")
+    # A cold start aims below the box resonance. Later passes sit on the last ω.
+    if sigma_omega is None:
+        shift = (0.35 * guess) ** 2
+    else:
+        shift = float(sigma_omega) ** 2
+    vals, vecs = eigsh(laplace, k=3, M=mass, sigma=shift, which="LM")
     pick = int(np.argmin(vals.real))
     omega0 = float(np.sqrt(vals[pick].real))
     ez = np.real(vecs[:, pick]).reshape(eps.shape)
