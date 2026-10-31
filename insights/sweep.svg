@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="420" viewBox="0 0 760 420">
+<rect width="100%" height="100%" fill="#fbfbfa"/>
+<text x="72" y="26" font-family="Georgia, serif" font-size="16" fill="#1c1c1c">κ loss and brush penalty versus gap</text>
+<line x1="72.0" y1="42" x2="72.0" y2="342" stroke="#e4e4e0"/>
+<line x1="72" y1="342.0" x2="736" y2="342.0" stroke="#e4e4e0"/>
+<text x="72.0" y="360" text-anchor="middle" font-family="ui-sans-serif, sans-serif" font-size="11" fill="#444">80</text>
+<text x="64" y="346.0" text-anchor="end" font-family="ui-sans-serif, sans-serif" font-size="11" fill="#444">-0.2</text>
+<line x1="238.0" y1="42" x2="238.0" y2="342" stroke="#e4e4e0"/>
+<line x1="72" y1="267.0" x2="736" y2="267.0" stroke="#e4e4e0"/>
+<text x="238.0" y="360" text-anchor="middle" font-family="ui-sans-serif, sans-serif" font-size="11" fill="#444">140</text>
+<text x="64" y="271.0" text-anchor="end" font-family="ui-sans-serif, sans-serif" font-size="11" fill="#444">0.733</text>
+<line x1="404.0" y1="42" x2="404.0" y2="342" stroke="#e4e4e0"/>
+<line x1="72" y1="192.0" x2="736" y2="192.0" stroke="#e4e4e0"/>
+<text x="404.0" y="360" text-anchor="middle" font-family="ui-sans-serif, sans-serif" font-size="11" fill="#444">200</text>
+<text x="64" y="196.0" text-anchor="end" font-family="ui-sans-serif, sans-serif" font-size="11" fill="#444">1.67</text>
+<line x1="570.0" y1="42" x2="570.0" y2="342" stroke="#e4e4e0"/>
+<line x1="72" y1="117.0" x2="736" y2="117.0" stroke="#e4e4e0"/>
+<text x="570.0" y="360" text-anchor="middle" font-family="ui-sans-serif, sans-serif" font-size="11" fill="#444">260</text>
+<text x="64" y="121.0" text-anchor="end" font-family="ui-sans-serif, sans-serif" font-size="11" fill="#444">2.6</text>
+<line x1="736.0" y1="42" x2="736.0" y2="342" stroke="#e4e4e0"/>
+<line x1="72" y1="42.0" x2="736" y2="42.0" stroke="#e4e4e0"/>
+<text x="736.0" y="360" text-anchor="middle" font-family="ui-sans-serif, sans-serif" font-size="11" fill="#444">320</text>
+<text x="64" y="46.0" text-anchor="end" font-family="ui-sans-serif, sans-serif" font-size="11" fill="#444">3.53</text>
+<line x1="72" y1="342" x2="736" y2="342" stroke="#222"/>
+<line x1="72" y1="42" x2="72" y2="342" stroke="#222"/>
+<polyline fill="none" stroke="#b15c2e" stroke-width="2" points="72.0,221.8 99.7,267.6 127.3,302.1 155.0,320.8 182.7,325.9 210.3,322.1 238.0,313.5 265.7,303.0 293.3,292.7 321.0,283.3 348.7,275.3 376.3,268.7 404.0,263.4 431.7,259.2 459.3,256.0 487.0,253.5 514.7,251.6 542.3,250.1 570.0,249.0 597.7,248.1 625.3,247.5 653.0,247.0 680.7,246.7 708.3,246.4 736.0,246.2"/>
+<polyline fill="none" stroke="#1f4b99" stroke-width="2" points="72.0,324.5 99.7,324.4 127.3,324.3 155.0,324.3 182.7,324.4 210.3,324.4 238.0,324.5 265.7,324.6 293.3,324.7 321.0,324.9 348.7,325.0 376.3,325.1 404.0,325.1 431.7,325.1 459.3,325.2 487.0,325.2 514.7,325.2 542.3,325.2 570.0,325.2 597.7,325.2 625.3,325.2 653.0,325.2 680.7,325.2 708.3,325.2 736.0,325.2"/>
+<polyline fill="none" stroke="#2c6e49" stroke-width="2" points="72.0,58.1 99.7,96.0 127.3,125.2 155.0,141.7 182.7,151.2 210.3,155.8 238.0,151.9 265.7,150.4 293.3,160.5 321.0,170.9 348.7,171.8 376.3,171.2 404.0,172.2 431.7,170.9 459.3,170.4 487.0,169.5 514.7,168.3 542.3,168.0 570.0,166.9 597.7,166.6 625.3,166.2 653.0,165.5 680.7,165.8 708.3,165.0 736.0,165.2"/>
+<line x1="72" y1="388" x2="94" y2="388" stroke="#b15c2e" stroke-width="2"/>
+<text x="100" y="392" font-family="ui-sans-serif, sans-serif" font-size="12" fill="#222">Optical κ loss</text>
+<line x1="292" y1="388" x2="314" y2="388" stroke="#1f4b99" stroke-width="2"/>
+<text x="320" y="392" font-family="ui-sans-serif, sans-serif" font-size="12" fill="#222">Brush penalty</text>
+<line x1="512" y1="388" x2="534" y2="388" stroke="#2c6e49" stroke-width="2"/>
+<text x="540" y="392" font-family="ui-sans-serif, sans-serif" font-size="12" fill="#222">Weighted sum</text>
+<text x="380.0" y="378" text-anchor="middle" font-family="ui-sans-serif, sans-serif" font-size="12" fill="#222">Gap (nm)</text>
+<text x="18" y="210.0" text-anchor="middle" font-family="ui-sans-serif, sans-serif" font-size="12" fill="#222" transform="rotate(-90 18 210.0)">Loss</text>
+<text x="72" y="412" font-family="ui-sans-serif, sans-serif" font-size="11" fill="#555">Source: coupled_benchmark.py · violation amplitude 0, before the Adam loop</text>
+</svg>
